@@ -91,8 +91,18 @@ impl StellarIdContract {
     // Admin
     // --------------------------------------------------------
 
-    /// Initialize the contract with an admin address
-    /// Initializes the contract. Must be called once before any other function.
+    /// Initializes the contract and sets the admin address.
+    ///
+    /// Must be called once before any other function. Resets credential and schema counters to zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `admin` - The address that will have admin privileges; must authorize the call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `admin` does not authorize the transaction.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -106,7 +116,22 @@ impl StellarIdContract {
     // Issuer Management
     // --------------------------------------------------------
 
-    /// Register a new issuer (admin only)
+    /// Registers a new issuer in the system.
+    ///
+    /// Only the contract admin may call this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `admin` - The contract admin address; must authorize the call.
+    /// * `issuer` - The address to register as an issuer.
+    /// * `name` - A display name for the issuer.
+    /// * `trust_level` - A trust score from 1 to 100.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is not initialized, `admin` is not the stored admin,
+    /// `admin` does not authorize the call, or `trust_level` is not in the range 1–100.
     pub fn register_issuer(
         env: Env,
         admin: Address,
@@ -142,7 +167,21 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_registered"),), (issuer,));
     }
 
-    /// Deactivate an issuer (admin only)
+    /// Deactivates a registered issuer.
+    ///
+    /// Only the contract admin may call this function. A deactivated issuer cannot issue
+    /// new credentials or register schemas.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `admin` - The contract admin address; must authorize the call.
+    /// * `issuer` - The address of the issuer to deactivate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is not initialized, `admin` is not the stored admin,
+    /// `admin` does not authorize the call, or `issuer` is not found.
     pub fn deactivate_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -167,7 +206,17 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_deactivated"),), (issuer,));
     }
 
-    /// Authorize a sub-issuer to issue credentials on behalf of a parent issuer
+    /// Authorizes a sub-issuer to act on behalf of a parent issuer.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `parent` - The parent issuer address; must authorize the call.
+    /// * `sub_issuer` - The address to authorize as a sub-issuer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `parent` does not authorize the call or `parent` is not a registered issuer.
     pub fn authorize_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         let _issuer_record: Issuer = env
@@ -187,7 +236,17 @@ impl StellarIdContract {
         );
     }
 
-    /// Revoke a sub-issuer authorization
+    /// Revokes a sub-issuer authorization previously granted by a parent issuer.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `parent` - The parent issuer address; must authorize the call.
+    /// * `sub_issuer` - The sub-issuer address whose authorization is revoked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `parent` does not authorize the call.
     pub fn revoke_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         env.storage().persistent().set(
@@ -205,7 +264,25 @@ impl StellarIdContract {
     // Schema Management
     // --------------------------------------------------------
 
-    /// Register a new credential schema (issuers only)
+    /// Registers a new credential schema.
+    ///
+    /// Only an active registered issuer may call this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The issuer address; must authorize the call.
+    /// * `name` - A non-empty name for the schema.
+    /// * `description` - A human-readable description of the schema.
+    ///
+    /// # Returns
+    ///
+    /// The newly assigned schema ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `issuer` does not authorize the call, `issuer` is not found,
+    /// `issuer` is not active, or `name` is empty.
     pub fn register_schema(env: Env, issuer: Address, name: String, description: String) -> u32 {
         issuer.require_auth();
         let issuer_record: Issuer = env
@@ -250,7 +327,27 @@ impl StellarIdContract {
     // Credential Issuance
     // --------------------------------------------------------
 
-    /// Issue a credential to a subject
+    /// Issues a verifiable credential to a subject.
+    ///
+    /// Creates or updates the subject's on-chain identity profile and increments the issuer's
+    /// credential count.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The issuer address; must authorize the call and be a registered, active issuer.
+    /// * `subject` - The address receiving the credential.
+    /// * `schema_id` - The ID of an active schema under which to issue the credential.
+    /// * `duration_seconds` - Lifetime in seconds; `0` means the credential never expires.
+    ///
+    /// # Returns
+    ///
+    /// The newly assigned credential ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `issuer` does not authorize the call, `issuer` is not a registered active issuer,
+    /// `schema_id` is not found, or the schema is not active.
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -326,7 +423,20 @@ impl StellarIdContract {
         credential_ids
     }
 
-    /// Revoke a credential (issuer only)
+    /// Revokes a previously issued credential.
+    ///
+    /// Only the original issuer may revoke a credential.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The original issuer address; must authorize the call.
+    /// * `credential_id` - The ID of the credential to revoke.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `issuer` does not authorize the call, the credential is not found,
+    /// `issuer` is not the original issuer, or the credential is already revoked.
     pub fn revoke_credential(env: Env, issuer: Address, credential_id: u64) {
         issuer.require_auth();
 
@@ -353,7 +463,22 @@ impl StellarIdContract {
         );
     }
 
-    /// Renew a credential (issuer only)
+    /// Extends the expiry of an existing credential.
+    ///
+    /// Only the original issuer may renew a credential. Non-expiring credentials cannot be renewed.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The original issuer address; must authorize the call.
+    /// * `credential_id` - The ID of the credential to renew.
+    /// * `additional_seconds` - The number of seconds to add to the current expiry; must be greater than zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `issuer` does not authorize the call, the credential is not found,
+    /// `issuer` is not the original issuer, the credential is revoked, `additional_seconds` is zero,
+    /// or the credential has no expiry (`expires_at == 0`).
     pub fn renew_credential(
         env: Env,
         issuer: Address,
@@ -558,7 +683,19 @@ impl StellarIdContract {
     // Query Functions
     // --------------------------------------------------------
 
-    /// Check if a subject has a valid (non-revoked, non-expired) credential for a schema
+    /// Returns whether a subject holds a valid credential for the given schema.
+    ///
+    /// A credential is valid when it is not revoked and either has no expiry or has not yet expired.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `subject` - The subject address to check.
+    /// * `schema_id` - The schema ID to match.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the subject has at least one valid credential for `schema_id`, otherwise `false`.
     pub fn has_valid_credential(env: Env, subject: Address, schema_id: u32) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -589,7 +726,19 @@ impl StellarIdContract {
         false
     }
 
-    /// Check if a subject has any valid credential from a specific issuer
+    /// Returns whether a subject holds any valid credential issued by a specific issuer.
+    ///
+    /// A credential is valid when it is not revoked and either has no expiry or has not yet expired.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `subject` - The subject address to check.
+    /// * `issuer` - The issuer address to match.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the subject has at least one valid credential from `issuer`, otherwise `false`.
     pub fn has_credential_from_issuer(env: Env, subject: Address, issuer: Address) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -620,7 +769,20 @@ impl StellarIdContract {
         false
     }
 
-    /// Get a credential by ID
+    /// Returns a credential by its ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `credential_id` - The ID of the credential to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// The [`Credential`] stored for `credential_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no credential exists for `credential_id`.
     pub fn get_credential(env: Env, credential_id: u64) -> Credential {
         env.storage()
             .persistent()
@@ -628,7 +790,20 @@ impl StellarIdContract {
             .expect("Credential not found")
     }
 
-    /// Get an identity profile
+    /// Returns the on-chain identity profile for a subject.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `subject` - The subject address whose identity to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// The [`Identity`] profile for `subject`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no identity exists for `subject` (i.e., no credential has been issued to them).
     pub fn get_identity(env: Env, subject: Address) -> Identity {
         env.storage()
             .persistent()
@@ -636,7 +811,20 @@ impl StellarIdContract {
             .expect("Identity not found")
     }
 
-    /// Get an issuer record
+    /// Returns the issuer record for an address.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The issuer address to look up.
+    ///
+    /// # Returns
+    ///
+    /// The [`Issuer`] record for `issuer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `issuer` is not registered.
     pub fn get_issuer(env: Env, issuer: Address) -> Issuer {
         env.storage()
             .persistent()
@@ -644,7 +832,20 @@ impl StellarIdContract {
             .expect("Issuer not found")
     }
 
-    /// Get a schema by ID
+    /// Returns a credential schema by its ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `schema_id` - The ID of the schema to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// The [`Schema`] stored for `schema_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no schema exists for `schema_id`.
     pub fn get_schema(env: Env, schema_id: u32) -> Schema {
         env.storage()
             .persistent()
@@ -652,7 +853,16 @@ impl StellarIdContract {
             .expect("Schema not found")
     }
 
-    /// Get all credential IDs for a subject
+    /// Returns all credential IDs issued to a subject.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `subject` - The subject address whose credentials to list.
+    ///
+    /// # Returns
+    ///
+    /// A vector of credential IDs; returns an empty vector if the subject has no credentials.
     pub fn get_subject_credentials(env: Env, subject: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -660,7 +870,15 @@ impl StellarIdContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get total credential count
+    /// Returns the total number of credentials issued by the contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    ///
+    /// The total credential count, or `0` if no credentials have been issued.
     pub fn get_credential_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -668,7 +886,15 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Get total schema count
+    /// Returns the total number of schemas registered in the contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    ///
+    /// The total schema count, or `0` if no schemas have been registered.
     pub fn get_schema_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -676,15 +902,17 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Get a pending transfer request for a credential
-    pub fn get_transfer_request(env: Env, credential_id: u64) -> TransferRequest {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TransferRequest(credential_id))
-            .expect("No pending transfer request")
-    }
-
-    /// Check if an address is an authorized sub-issuer for a parent
+    /// Returns whether an address is an authorized sub-issuer for a parent issuer.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `parent` - The parent issuer address.
+    /// * `sub_issuer` - The candidate sub-issuer address.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `sub_issuer` is currently authorized under `parent`, otherwise `false`.
     pub fn is_sub_issuer(env: Env, parent: Address, sub_issuer: Address) -> bool {
         env.storage()
             .persistent()
@@ -956,6 +1184,60 @@ mod tests {
         client.issue_credential(&issuer, &subject, &schema_id, &500u64);
         env.ledger().set_timestamp(2000);
         assert!(!client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_has_valid_credential_expires_at_now_boundary() {
+        let env = Env::default();
+        // Issue at 1000, duration 500 => expires_at = 1500
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64);
+        // Move time to exactly the expiry moment; should be considered expired
+        env.ledger().set_timestamp(1500);
+        assert!(!client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_non_expiring_credential_indefinite() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        // duration_seconds = 0 => no expiry
+        client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        // Advance time far into the future
+        env.ledger().set_timestamp(10_000_000);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_multiple_credentials_same_schema_one_expired_one_valid() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        // Issue first credential that will expire early
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64); // expires at 1500
+
+        // Advance time a bit and issue a second credential that lasts longer
+        env.ledger().set_timestamp(1200);
+        client.issue_credential(&issuer, &subject, &schema_id, &2000u64); // expires at 3200
+
+        // Move to a time where first is expired but second is still valid
+        env.ledger().set_timestamp(2000);
+        assert!(client.has_valid_credential(&subject, &schema_id));
     }
 
     #[test]
