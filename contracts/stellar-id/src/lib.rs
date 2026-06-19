@@ -109,7 +109,7 @@ impl StellarIdContract {
             .expect("Not initialized");
         assert!(admin == stored_admin, "Only admin can register issuers");
         assert!(
-            trust_level >= 1 && trust_level <= 100,
+            (1..=100).contains(&trust_level),
             "Trust level must be 1-100"
         );
 
