@@ -50,16 +50,6 @@ pub struct Identity {
     pub created_at: u64,
 }
 
-/// A pending request to transfer a credential to a new subject address
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TransferRequest {
-    pub credential_id: u64,
-    pub from: Address,
-    pub to: Address,
-    pub requested_at: u64,
-}
-
 /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -74,8 +64,6 @@ pub enum DataKey {
     SubjectCredentials(Address),
     // authorized sub-issuers: (parent_issuer, sub_issuer) -> bool
     SubIssuer(Address, Address),
-    // credential_id -> pending TransferRequest
-    TransferRequest(u64),
 }
 
 // ============================================================
@@ -91,18 +79,7 @@ impl StellarIdContract {
     // Admin
     // --------------------------------------------------------
 
-    /// Initializes the contract and sets the admin address.
-    ///
-    /// Must be called once before any other function. Resets credential and schema counters to zero.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `admin` - The address that will have admin privileges; must authorize the call.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `admin` does not authorize the transaction.
+    /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -116,22 +93,7 @@ impl StellarIdContract {
     // Issuer Management
     // --------------------------------------------------------
 
-    /// Registers a new issuer in the system.
-    ///
-    /// Only the contract admin may call this function.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `admin` - The contract admin address; must authorize the call.
-    /// * `issuer` - The address to register as an issuer.
-    /// * `name` - A display name for the issuer.
-    /// * `trust_level` - A trust score from 1 to 100.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the contract is not initialized, `admin` is not the stored admin,
-    /// `admin` does not authorize the call, or `trust_level` is not in the range 1–100.
+    /// Register a new issuer (admin only)
     pub fn register_issuer(
         env: Env,
         admin: Address,
@@ -147,7 +109,7 @@ impl StellarIdContract {
             .expect("Not initialized");
         assert!(admin == stored_admin, "Only admin can register issuers");
         assert!(
-            (1..=100).contains(&trust_level),
+            trust_level >= 1 && trust_level <= 100,
             "Trust level must be 1-100"
         );
 
@@ -167,21 +129,7 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_registered"),), (issuer,));
     }
 
-    /// Deactivates a registered issuer.
-    ///
-    /// Only the contract admin may call this function. A deactivated issuer cannot issue
-    /// new credentials or register schemas.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `admin` - The contract admin address; must authorize the call.
-    /// * `issuer` - The address of the issuer to deactivate.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the contract is not initialized, `admin` is not the stored admin,
-    /// `admin` does not authorize the call, or `issuer` is not found.
+    /// Deactivate an issuer (admin only)
     pub fn deactivate_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -206,17 +154,7 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_deactivated"),), (issuer,));
     }
 
-    /// Authorizes a sub-issuer to act on behalf of a parent issuer.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `parent` - The parent issuer address; must authorize the call.
-    /// * `sub_issuer` - The address to authorize as a sub-issuer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `parent` does not authorize the call or `parent` is not a registered issuer.
+    /// Authorize a sub-issuer to issue credentials on behalf of a parent issuer
     pub fn authorize_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         let _issuer_record: Issuer = env
@@ -236,17 +174,7 @@ impl StellarIdContract {
         );
     }
 
-    /// Revokes a sub-issuer authorization previously granted by a parent issuer.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `parent` - The parent issuer address; must authorize the call.
-    /// * `sub_issuer` - The sub-issuer address whose authorization is revoked.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `parent` does not authorize the call.
+    /// Revoke a sub-issuer authorization
     pub fn revoke_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         env.storage().persistent().set(
@@ -264,25 +192,7 @@ impl StellarIdContract {
     // Schema Management
     // --------------------------------------------------------
 
-    /// Registers a new credential schema.
-    ///
-    /// Only an active registered issuer may call this function.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `issuer` - The issuer address; must authorize the call.
-    /// * `name` - A non-empty name for the schema.
-    /// * `description` - A human-readable description of the schema.
-    ///
-    /// # Returns
-    ///
-    /// The newly assigned schema ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `issuer` does not authorize the call, `issuer` is not found,
-    /// `issuer` is not active, or `name` is empty.
+    /// Register a new credential schema (issuers only)
     pub fn register_schema(env: Env, issuer: Address, name: String, description: String) -> u32 {
         issuer.require_auth();
         let issuer_record: Issuer = env
@@ -327,27 +237,7 @@ impl StellarIdContract {
     // Credential Issuance
     // --------------------------------------------------------
 
-    /// Issues a verifiable credential to a subject.
-    ///
-    /// Creates or updates the subject's on-chain identity profile and increments the issuer's
-    /// credential count.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `issuer` - The issuer address; must authorize the call and be a registered, active issuer.
-    /// * `subject` - The address receiving the credential.
-    /// * `schema_id` - The ID of an active schema under which to issue the credential.
-    /// * `duration_seconds` - Lifetime in seconds; `0` means the credential never expires.
-    ///
-    /// # Returns
-    ///
-    /// The newly assigned credential ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `issuer` does not authorize the call, `issuer` is not a registered active issuer,
-    /// `schema_id` is not found, or the schema is not active.
+    /// Issue a credential to a subject
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -357,11 +247,88 @@ impl StellarIdContract {
     ) -> u64 {
         issuer.require_auth();
 
-        let (effective_trust, now, expires_at) =
-            Self::validate_and_prepare(&env, &issuer, schema_id, duration_seconds);
+        let issuer_record: Option<Issuer> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()));
 
-        let credential_id =
-            Self::issue_credential_inner(&env, &issuer, subject, schema_id, effective_trust, now, expires_at);
+        let effective_trust: u32;
+
+        if let Some(record) = issuer_record {
+            assert!(record.active, "Issuer is not active");
+            effective_trust = record.trust_level;
+        } else {
+            panic!("Not a registered issuer");
+        }
+
+        let schema: Schema = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schema(schema_id))
+            .expect("Schema not found");
+        assert!(schema.active, "Schema is not active");
+
+        let now = env.ledger().timestamp();
+        let expires_at = if duration_seconds > 0 {
+            now + duration_seconds
+        } else {
+            0
+        };
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CredentialCount)
+            .unwrap_or(0);
+        let credential_id = count + 1;
+
+        let credential = Credential {
+            id: credential_id,
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+            schema_id,
+            issued_at: now,
+            expires_at,
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Credential(credential_id), &credential);
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialCount, &credential_id);
+
+        let mut subject_creds: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubjectCredentials(subject.clone()))
+            .unwrap_or(Vec::new(&env));
+        subject_creds.push_back(credential_id);
+        env.storage().persistent().set(
+            &DataKey::SubjectCredentials(subject.clone()),
+            &subject_creds,
+        );
+
+        let existing: Option<Identity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Identity(subject.clone()));
+        let identity = if let Some(mut id) = existing {
+            id.credential_count += 1;
+            id.reputation_score = Self::compute_reputation(id.credential_count, effective_trust);
+            id
+        } else {
+            Identity {
+                subject: subject.clone(),
+                credential_count: 1,
+                reputation_score: effective_trust / 10,
+                created_at: now,
+            }
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Identity(subject.clone()), &identity);
 
         let mut issuer_rec: Issuer = env
             .storage()
@@ -373,70 +340,15 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
 
+        env.events().publish(
+            (Symbol::new(&env, "credential_issued"),),
+            (credential_id, subject, issuer),
+        );
+
         credential_id
     }
 
-    /// Issue credentials to multiple subjects in a single transaction
-    pub fn batch_issue_credentials(
-        env: Env,
-        issuer: Address,
-        subjects: Vec<Address>,
-        schema_id: u32,
-        duration_seconds: u64,
-    ) -> Vec<u64> {
-        issuer.require_auth();
-
-        let (effective_trust, now, expires_at) =
-            Self::validate_and_prepare(&env, &issuer, schema_id, duration_seconds);
-
-        let batch_count = subjects.len();
-        let mut credential_ids = Vec::new(&env);
-
-        for subject in subjects.iter() {
-            let cred_id = Self::issue_credential_inner(
-                &env,
-                &issuer,
-                subject,
-                schema_id,
-                effective_trust,
-                now,
-                expires_at,
-            );
-            credential_ids.push_back(cred_id);
-        }
-
-        let mut issuer_rec: Issuer = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += batch_count as u64;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
-
-        env.events().publish(
-            (Symbol::new(&env, "credentials_batch_issued"),),
-            (batch_count, issuer, schema_id),
-        );
-
-        credential_ids
-    }
-
-    /// Revokes a previously issued credential.
-    ///
-    /// Only the original issuer may revoke a credential.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `issuer` - The original issuer address; must authorize the call.
-    /// * `credential_id` - The ID of the credential to revoke.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `issuer` does not authorize the call, the credential is not found,
-    /// `issuer` is not the original issuer, or the credential is already revoked.
+    /// Revoke a credential (issuer only)
     pub fn revoke_credential(env: Env, issuer: Address, credential_id: u64) {
         issuer.require_auth();
 
@@ -463,239 +375,11 @@ impl StellarIdContract {
         );
     }
 
-    /// Extends the expiry of an existing credential.
-    ///
-    /// Only the original issuer may renew a credential. Non-expiring credentials cannot be renewed.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `issuer` - The original issuer address; must authorize the call.
-    /// * `credential_id` - The ID of the credential to renew.
-    /// * `additional_seconds` - The number of seconds to add to the current expiry; must be greater than zero.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `issuer` does not authorize the call, the credential is not found,
-    /// `issuer` is not the original issuer, the credential is revoked, `additional_seconds` is zero,
-    /// or the credential has no expiry (`expires_at == 0`).
-    pub fn renew_credential(
-        env: Env,
-        issuer: Address,
-        credential_id: u64,
-        additional_seconds: u64,
-    ) {
-        issuer.require_auth();
-
-        let mut credential: Credential = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Credential(credential_id))
-            .expect("Credential not found");
-
-        if credential.issuer != issuer {
-            panic!("Only the original issuer can renew");
-        }
-        if credential.revoked {
-            panic!("Cannot renew a revoked credential");
-        }
-        if additional_seconds == 0 {
-            panic!("Additional seconds must be greater than zero");
-        }
-
-        if credential.expires_at == 0 {
-            panic!("Cannot renew a non-expiring credential");
-        }
-
-        let new_expires_at = credential.expires_at + additional_seconds;
-        credential.expires_at = new_expires_at;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Credential(credential_id), &credential);
-
-        env.events().publish(
-            (Symbol::new(&env, "credential_renewed"),),
-            (credential_id, new_expires_at),
-        );
-    }
-
-    // --------------------------------------------------------
-    // Credential Transfer
-    // --------------------------------------------------------
-
-    /// Subject proposes transferring a credential to a new address (step 1 of 2)
-    pub fn propose_transfer(
-        env: Env,
-        subject: Address,
-        credential_id: u64,
-        new_address: Address,
-    ) {
-        subject.require_auth();
-
-        let credential: Credential = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Credential(credential_id))
-            .expect("Credential not found");
-
-        assert!(
-            credential.subject == subject,
-            "Only the credential subject can propose a transfer"
-        );
-        assert!(!credential.revoked, "Cannot transfer a revoked credential");
-        assert!(
-            new_address != subject,
-            "Cannot transfer to the same address"
-        );
-
-        let request = TransferRequest {
-            credential_id,
-            from: subject.clone(),
-            to: new_address.clone(),
-            requested_at: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::TransferRequest(credential_id), &request);
-
-        env.events().publish(
-            (Symbol::new(&env, "credential_transfer_proposed"),),
-            (credential_id, subject, new_address),
-        );
-    }
-
-    /// Issuer countersigns and executes a pending credential transfer (step 2 of 2)
-    pub fn approve_transfer(env: Env, issuer: Address, credential_id: u64) {
-        issuer.require_auth();
-
-        let mut credential: Credential = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Credential(credential_id))
-            .expect("Credential not found");
-
-        assert!(
-            credential.issuer == issuer,
-            "Only the original issuer can approve the transfer"
-        );
-
-        let request: TransferRequest = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TransferRequest(credential_id))
-            .expect("No pending transfer request");
-
-        let from = request.from.clone();
-        let to = request.to.clone();
-
-        // Repoint the credential to the new subject
-        credential.subject = to.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Credential(credential_id), &credential);
-
-        // Remove credential_id from sender's list
-        let from_creds: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SubjectCredentials(from.clone()))
-            .unwrap_or(Vec::new(&env));
-        let mut new_from_creds = Vec::new(&env);
-        for cid in from_creds.iter() {
-            if cid != credential_id {
-                new_from_creds.push_back(cid);
-            }
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::SubjectCredentials(from.clone()), &new_from_creds);
-
-        // Add credential_id to receiver's list
-        let mut to_creds: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SubjectCredentials(to.clone()))
-            .unwrap_or(Vec::new(&env));
-        to_creds.push_back(credential_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::SubjectCredentials(to.clone()), &to_creds);
-
-        // Fetch the issuer's trust level for reputation recomputation
-        let trust_level = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
-            .map(|r| r.trust_level)
-            .unwrap_or(0);
-
-        // Decrement sender's identity credential count
-        if let Some(mut from_identity) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Identity>(&DataKey::Identity(from.clone()))
-        {
-            if from_identity.credential_count > 0 {
-                from_identity.credential_count -= 1;
-            }
-            from_identity.reputation_score =
-                Self::compute_reputation(from_identity.credential_count, trust_level);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Identity(from.clone()), &from_identity);
-        }
-
-        // Create or update receiver's identity
-        let now = env.ledger().timestamp();
-        let to_identity = if let Some(mut id) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Identity>(&DataKey::Identity(to.clone()))
-        {
-            id.credential_count += 1;
-            id.reputation_score = Self::compute_reputation(id.credential_count, trust_level);
-            id
-        } else {
-            Identity {
-                subject: to.clone(),
-                credential_count: 1,
-                reputation_score: trust_level / 10,
-                created_at: now,
-            }
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Identity(to.clone()), &to_identity);
-
-        // Clear the pending request now that it is fulfilled
-        env.storage()
-            .persistent()
-            .remove(&DataKey::TransferRequest(credential_id));
-
-        env.events().publish(
-            (Symbol::new(&env, "credential_transfer_approved"),),
-            (credential_id, from, to),
-        );
-    }
-
     // --------------------------------------------------------
     // Query Functions
     // --------------------------------------------------------
 
-    /// Returns whether a subject holds a valid credential for the given schema.
-    ///
-    /// A credential is valid when it is not revoked and either has no expiry or has not yet expired.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `subject` - The subject address to check.
-    /// * `schema_id` - The schema ID to match.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the subject has at least one valid credential for `schema_id`, otherwise `false`.
+    /// Check if a subject has a valid (non-revoked, non-expired) credential for a schema
     pub fn has_valid_credential(env: Env, subject: Address, schema_id: u32) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -726,19 +410,7 @@ impl StellarIdContract {
         false
     }
 
-    /// Returns whether a subject holds any valid credential issued by a specific issuer.
-    ///
-    /// A credential is valid when it is not revoked and either has no expiry or has not yet expired.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `subject` - The subject address to check.
-    /// * `issuer` - The issuer address to match.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the subject has at least one valid credential from `issuer`, otherwise `false`.
+    /// Check if a subject has any valid credential from a specific issuer
     pub fn has_credential_from_issuer(env: Env, subject: Address, issuer: Address) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -769,20 +441,7 @@ impl StellarIdContract {
         false
     }
 
-    /// Returns a credential by its ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `credential_id` - The ID of the credential to retrieve.
-    ///
-    /// # Returns
-    ///
-    /// The [`Credential`] stored for `credential_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no credential exists for `credential_id`.
+    /// Get a credential by ID
     pub fn get_credential(env: Env, credential_id: u64) -> Credential {
         env.storage()
             .persistent()
@@ -790,20 +449,7 @@ impl StellarIdContract {
             .expect("Credential not found")
     }
 
-    /// Returns the on-chain identity profile for a subject.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `subject` - The subject address whose identity to retrieve.
-    ///
-    /// # Returns
-    ///
-    /// The [`Identity`] profile for `subject`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no identity exists for `subject` (i.e., no credential has been issued to them).
+    /// Get an identity profile
     pub fn get_identity(env: Env, subject: Address) -> Identity {
         env.storage()
             .persistent()
@@ -811,20 +457,7 @@ impl StellarIdContract {
             .expect("Identity not found")
     }
 
-    /// Returns the issuer record for an address.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `issuer` - The issuer address to look up.
-    ///
-    /// # Returns
-    ///
-    /// The [`Issuer`] record for `issuer`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `issuer` is not registered.
+    /// Get an issuer record
     pub fn get_issuer(env: Env, issuer: Address) -> Issuer {
         env.storage()
             .persistent()
@@ -832,20 +465,7 @@ impl StellarIdContract {
             .expect("Issuer not found")
     }
 
-    /// Returns a credential schema by its ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `schema_id` - The ID of the schema to retrieve.
-    ///
-    /// # Returns
-    ///
-    /// The [`Schema`] stored for `schema_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no schema exists for `schema_id`.
+    /// Get a schema by ID
     pub fn get_schema(env: Env, schema_id: u32) -> Schema {
         env.storage()
             .persistent()
@@ -853,16 +473,7 @@ impl StellarIdContract {
             .expect("Schema not found")
     }
 
-    /// Returns all credential IDs issued to a subject.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `subject` - The subject address whose credentials to list.
-    ///
-    /// # Returns
-    ///
-    /// A vector of credential IDs; returns an empty vector if the subject has no credentials.
+    /// Get all credential IDs for a subject
     pub fn get_subject_credentials(env: Env, subject: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -870,15 +481,7 @@ impl StellarIdContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Returns the total number of credentials issued by the contract.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    ///
-    /// # Returns
-    ///
-    /// The total credential count, or `0` if no credentials have been issued.
+    /// Get total credential count
     pub fn get_credential_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -886,15 +489,7 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Returns the total number of schemas registered in the contract.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    ///
-    /// # Returns
-    ///
-    /// The total schema count, or `0` if no schemas have been registered.
+    /// Get total schema count
     pub fn get_schema_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -902,17 +497,7 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Returns whether an address is an authorized sub-issuer for a parent issuer.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The Soroban environment.
-    /// * `parent` - The parent issuer address.
-    /// * `sub_issuer` - The candidate sub-issuer address.
-    ///
-    /// # Returns
-    ///
-    /// `true` if `sub_issuer` is currently authorized under `parent`, otherwise `false`.
+    /// Check if an address is an authorized sub-issuer for a parent
     pub fn is_sub_issuer(env: Env, parent: Address, sub_issuer: Address) -> bool {
         env.storage()
             .persistent()
@@ -923,116 +508,6 @@ impl StellarIdContract {
     // --------------------------------------------------------
     // Internal helpers
     // --------------------------------------------------------
-
-    /// Validate issuer + schema and compute timing params. Returns (effective_trust, now, expires_at).
-    fn validate_and_prepare(
-        env: &Env,
-        issuer: &Address,
-        schema_id: u32,
-        duration_seconds: u64,
-    ) -> (u32, u64, u64) {
-        let issuer_record: Option<Issuer> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Issuer(issuer.clone()));
-
-        let effective_trust = if let Some(record) = issuer_record {
-            assert!(record.active, "Issuer is not active");
-            record.trust_level
-        } else {
-            panic!("Not a registered issuer");
-        };
-
-        let schema: Schema = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Schema(schema_id))
-            .expect("Schema not found");
-        assert!(schema.active, "Schema is not active");
-
-        let now = env.ledger().timestamp();
-        let expires_at = if duration_seconds > 0 {
-            now + duration_seconds
-        } else {
-            0
-        };
-
-        (effective_trust, now, expires_at)
-    }
-
-    /// Create and store a single credential for one subject, update identity, emit event.
-    /// Caller is responsible for updating the issuer's credential_count.
-    fn issue_credential_inner(
-        env: &Env,
-        issuer: &Address,
-        subject: Address,
-        schema_id: u32,
-        effective_trust: u32,
-        now: u64,
-        expires_at: u64,
-    ) -> u64 {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CredentialCount)
-            .unwrap_or(0);
-        let credential_id = count + 1;
-
-        let credential = Credential {
-            id: credential_id,
-            subject: subject.clone(),
-            issuer: issuer.clone(),
-            schema_id,
-            issued_at: now,
-            expires_at,
-            revoked: false,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Credential(credential_id), &credential);
-        env.storage()
-            .instance()
-            .set(&DataKey::CredentialCount, &credential_id);
-
-        let mut subject_creds: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SubjectCredentials(subject.clone()))
-            .unwrap_or(Vec::new(env));
-        subject_creds.push_back(credential_id);
-        env.storage().persistent().set(
-            &DataKey::SubjectCredentials(subject.clone()),
-            &subject_creds,
-        );
-
-        let existing: Option<Identity> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Identity(subject.clone()));
-        let identity = if let Some(mut id) = existing {
-            id.credential_count += 1;
-            id.reputation_score = Self::compute_reputation(id.credential_count, effective_trust);
-            id
-        } else {
-            Identity {
-                subject: subject.clone(),
-                credential_count: 1,
-                reputation_score: effective_trust / 10,
-                created_at: now,
-            }
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Identity(subject.clone()), &identity);
-
-        env.events().publish(
-            (Symbol::new(env, "credential_issued"),),
-            (credential_id, subject, issuer.clone()),
-        );
-
-        credential_id
-    }
 
     fn compute_reputation(credential_count: u32, trust_level: u32) -> u32 {
         let base = credential_count * 10;
@@ -1184,60 +659,6 @@ mod tests {
         client.issue_credential(&issuer, &subject, &schema_id, &500u64);
         env.ledger().set_timestamp(2000);
         assert!(!client.has_valid_credential(&subject, &schema_id));
-    }
-
-    #[test]
-    fn test_has_valid_credential_expires_at_now_boundary() {
-        let env = Env::default();
-        // Issue at 1000, duration 500 => expires_at = 1500
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        client.issue_credential(&issuer, &subject, &schema_id, &500u64);
-        // Move time to exactly the expiry moment; should be considered expired
-        env.ledger().set_timestamp(1500);
-        assert!(!client.has_valid_credential(&subject, &schema_id));
-    }
-
-    #[test]
-    fn test_non_expiring_credential_indefinite() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        // duration_seconds = 0 => no expiry
-        client.issue_credential(&issuer, &subject, &schema_id, &0u64);
-
-        // Advance time far into the future
-        env.ledger().set_timestamp(10_000_000);
-        assert!(client.has_valid_credential(&subject, &schema_id));
-    }
-
-    #[test]
-    fn test_multiple_credentials_same_schema_one_expired_one_valid() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        // Issue first credential that will expire early
-        client.issue_credential(&issuer, &subject, &schema_id, &500u64); // expires at 1500
-
-        // Advance time a bit and issue a second credential that lasts longer
-        env.ledger().set_timestamp(1200);
-        client.issue_credential(&issuer, &subject, &schema_id, &2000u64); // expires at 3200
-
-        // Move to a time where first is expired but second is still valid
-        env.ledger().set_timestamp(2000);
-        assert!(client.has_valid_credential(&subject, &schema_id));
     }
 
     #[test]
@@ -1394,149 +815,5 @@ mod tests {
 
         let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
         client.revoke_credential(&attacker, &cred_id);
-    }
-
-    #[test]
-    fn test_renew_credential_happy_path() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600u64);
-        let cred = client.get_credential(&cred_id);
-        assert_eq!(cred.expires_at, 4600);
-
-        client.renew_credential(&issuer, &cred_id, &1800u64);
-        let renewed_cred = client.get_credential(&cred_id);
-        assert_eq!(renewed_cred.expires_at, 6400);
-        assert!(!renewed_cred.revoked);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only the original issuer can renew")]
-    fn test_renew_credential_non_issuer() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-        let attacker = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600u64);
-        client.renew_credential(&attacker, &cred_id, &1800u64);
-    }
-
-    #[test]
-    #[should_panic(expected = "Cannot renew a revoked credential")]
-    fn test_renew_credential_revoked() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600u64);
-        client.revoke_credential(&issuer, &cred_id);
-        client.renew_credential(&issuer, &cred_id, &1800u64);
-    }
-
-    #[test]
-    #[should_panic(expected = "Cannot renew a non-expiring credential")]
-    fn test_renew_credential_non_expiring() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
-        client.renew_credential(&issuer, &cred_id, &1800u64);
-    }
-
-    #[test]
-    #[should_panic(expected = "Additional seconds must be greater than zero")]
-    fn test_renew_credential_zero_seconds() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600u64);
-        client.renew_credential(&issuer, &cred_id, &0u64);
-    }
-
-    #[test]
-    fn test_batch_issue_credentials() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-
-        let subject1 = Address::generate(&env);
-        let subject2 = Address::generate(&env);
-        let subject3 = Address::generate(&env);
-
-        let mut subjects = Vec::new(&env);
-        subjects.push_back(subject1.clone());
-        subjects.push_back(subject2.clone());
-        subjects.push_back(subject3.clone());
-
-        let cred_ids = client.batch_issue_credentials(&issuer, &subjects, &schema_id, &0u64);
-
-        assert_eq!(cred_ids.len(), 3);
-        assert_eq!(client.get_credential_count(), 3);
-
-        // IDs are sequential starting from 1
-        assert_eq!(cred_ids.get(0).unwrap(), 1u64);
-        assert_eq!(cred_ids.get(1).unwrap(), 2u64);
-        assert_eq!(cred_ids.get(2).unwrap(), 3u64);
-
-        // Each subject received a valid credential
-        assert!(client.has_valid_credential(&subject1, &schema_id));
-        assert!(client.has_valid_credential(&subject2, &schema_id));
-        assert!(client.has_valid_credential(&subject3, &schema_id));
-
-        // Each subject got an identity record
-        assert_eq!(client.get_identity(&subject1).credential_count, 1);
-        assert_eq!(client.get_identity(&subject2).credential_count, 1);
-        assert_eq!(client.get_identity(&subject3).credential_count, 1);
-
-        // Issuer credential_count reflects the full batch
-        assert_eq!(client.get_issuer(&issuer).credential_count, 3);
-    }
-
-    #[test]
-    #[should_panic(expected = "Schema is not active")]
-    fn test_batch_issue_inactive_schema_panics() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-
-        // Deactivate the schema by writing directly into contract storage
-        env.as_contract(&client.address, || {
-            let schema: Schema = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Schema(schema_id))
-                .unwrap();
-            env.storage()
-                .persistent()
-                .set(&DataKey::Schema(schema_id), &Schema { active: false, ..schema });
-        });
-
-        let mut subjects = Vec::new(&env);
-        subjects.push_back(Address::generate(&env));
-        client.batch_issue_credentials(&issuer, &subjects, &schema_id, &0u64);
     }
 }
