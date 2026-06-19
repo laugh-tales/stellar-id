@@ -704,6 +704,60 @@ mod tests {
     }
 
     #[test]
+    fn test_has_valid_credential_expires_at_now_boundary() {
+        let env = Env::default();
+        // Issue at 1000, duration 500 => expires_at = 1500
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64);
+        // Move time to exactly the expiry moment; should be considered expired
+        env.ledger().set_timestamp(1500);
+        assert!(!client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_non_expiring_credential_indefinite() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        // duration_seconds = 0 => no expiry
+        client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        // Advance time far into the future
+        env.ledger().set_timestamp(10_000_000);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_multiple_credentials_same_schema_one_expired_one_valid() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        // Issue first credential that will expire early
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64); // expires at 1500
+
+        // Advance time a bit and issue a second credential that lasts longer
+        env.ledger().set_timestamp(1200);
+        client.issue_credential(&issuer, &subject, &schema_id, &2000u64); // expires at 3200
+
+        // Move to a time where first is expired but second is still valid
+        env.ledger().set_timestamp(2000);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
     fn test_revoke_credential() {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
