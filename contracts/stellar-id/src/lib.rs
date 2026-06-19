@@ -1,7 +1,5 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 // ============================================================
 // Data Types
@@ -56,9 +54,9 @@ pub struct Identity {
 #[contracttype]
 pub enum DataKey {
     Admin,
-    Credential(u64),   // credential_id -> Credential
+    Credential(u64), // credential_id -> Credential
     CredentialCount,
-    Schema(u32),       // schema_id -> Schema
+    Schema(u32), // schema_id -> Schema
     SchemaCount,
     Issuer(Address),   // issuer address -> Issuer
     Identity(Address), // subject address -> Identity
@@ -88,9 +86,7 @@ impl StellarIdContract {
         env.storage()
             .instance()
             .set(&DataKey::CredentialCount, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::SchemaCount, &0u32);
+        env.storage().instance().set(&DataKey::SchemaCount, &0u32);
     }
 
     // --------------------------------------------------------
@@ -112,7 +108,10 @@ impl StellarIdContract {
             .get(&DataKey::Admin)
             .expect("Not initialized");
         assert!(admin == stored_admin, "Only admin can register issuers");
-        assert!(trust_level >= 1 && trust_level <= 100, "Trust level must be 1-100");
+        assert!(
+            trust_level >= 1 && trust_level <= 100,
+            "Trust level must be 1-100"
+        );
 
         let issuer_record = Issuer {
             address: issuer.clone(),
@@ -194,12 +193,7 @@ impl StellarIdContract {
     // --------------------------------------------------------
 
     /// Register a new credential schema (issuers only)
-    pub fn register_schema(
-        env: Env,
-        issuer: Address,
-        name: String,
-        description: String,
-    ) -> u32 {
+    pub fn register_schema(env: Env, issuer: Address, name: String, description: String) -> u32 {
         issuer.require_auth();
         let issuer_record: Issuer = env
             .storage()
@@ -231,8 +225,10 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::SchemaCount, &schema_id);
 
-        env.events()
-            .publish((Symbol::new(&env, "schema_registered"),), (schema_id, issuer));
+        env.events().publish(
+            (Symbol::new(&env, "schema_registered"),),
+            (schema_id, issuer),
+        );
 
         schema_id
     }
@@ -247,11 +243,10 @@ impl StellarIdContract {
         issuer: Address,
         subject: Address,
         schema_id: u32,
-        duration_seconds: u64, // 0 = no expiry
+        duration_seconds: u64,
     ) -> u64 {
         issuer.require_auth();
 
-        // Verify issuer is active (or is an authorized sub-issuer)
         let issuer_record: Option<Issuer> = env
             .storage()
             .persistent()
@@ -263,12 +258,9 @@ impl StellarIdContract {
             assert!(record.active, "Issuer is not active");
             effective_trust = record.trust_level;
         } else {
-            // Check if this is an authorized sub-issuer for any parent
-            // Sub-issuers must have been authorized
             panic!("Not a registered issuer");
         }
 
-        // Verify schema exists
         let schema: Schema = env
             .storage()
             .persistent()
@@ -307,7 +299,6 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::CredentialCount, &credential_id);
 
-        // Update subject's credential list
         let mut subject_creds: Vec<u64> = env
             .storage()
             .persistent()
@@ -319,9 +310,10 @@ impl StellarIdContract {
             &subject_creds,
         );
 
-        // Update or create identity record
-        let existing: Option<Identity> =
-            env.storage().persistent().get(&DataKey::Identity(subject.clone()));
+        let existing: Option<Identity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Identity(subject.clone()));
         let identity = if let Some(mut id) = existing {
             id.credential_count += 1;
             id.reputation_score = Self::compute_reputation(id.credential_count, effective_trust);
@@ -338,16 +330,15 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Identity(subject.clone()), &identity);
 
-        // Update issuer credential count
-        let mut issuer_record: Issuer = env
+        let mut issuer_rec: Issuer = env
             .storage()
             .persistent()
             .get(&DataKey::Issuer(issuer.clone()))
             .expect("Issuer not found");
-        issuer_record.credential_count += 1;
+        issuer_rec.credential_count += 1;
         env.storage()
             .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_record);
+            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
 
         env.events().publish(
             (Symbol::new(&env, "credential_issued"),),
@@ -367,7 +358,10 @@ impl StellarIdContract {
             .get(&DataKey::Credential(credential_id))
             .expect("Credential not found");
 
-        assert!(credential.issuer == issuer, "Only the original issuer can revoke");
+        assert!(
+            credential.issuer == issuer,
+            "Only the original issuer can revoke"
+        );
         assert!(!credential.revoked, "Credential already revoked");
 
         credential.revoked = true;
@@ -417,11 +411,7 @@ impl StellarIdContract {
     }
 
     /// Check if a subject has any valid credential from a specific issuer
-    pub fn has_credential_from_issuer(
-        env: Env,
-        subject: Address,
-        issuer: Address,
-    ) -> bool {
+    pub fn has_credential_from_issuer(env: Env, subject: Address, issuer: Address) -> bool {
         let creds: Vec<u64> = match env
             .storage()
             .persistent()
@@ -533,7 +523,10 @@ impl StellarIdContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Env, String,
+    };
 
     fn setup(env: &Env) -> (Address, StellarIdContractClient<'_>) {
         env.mock_all_auths();
@@ -637,7 +630,7 @@ mod tests {
 
         let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600u64);
         let cred = client.get_credential(&cred_id);
-        assert_eq!(cred.expires_at, 4600); // 1000 + 3600
+        assert_eq!(cred.expires_at, 4600);
     }
 
     #[test]
@@ -664,7 +657,6 @@ mod tests {
         let subject = Address::generate(&env);
 
         client.issue_credential(&issuer, &subject, &schema_id, &500u64);
-        // expires at 1500; advance time past expiry
         env.ledger().set_timestamp(2000);
         assert!(!client.has_valid_credential(&subject, &schema_id));
     }
@@ -717,12 +709,10 @@ mod tests {
         let subject = Address::generate(&env);
 
         client.issue_credential(&issuer, &subject, &s1, &0u64);
-        let identity1 = client.get_identity(&subject);
-        let rep1 = identity1.reputation_score;
+        let rep1 = client.get_identity(&subject).reputation_score;
 
         client.issue_credential(&issuer, &subject, &s2, &0u64);
-        let identity2 = client.get_identity(&subject);
-        assert!(identity2.reputation_score > rep1);
+        assert!(client.get_identity(&subject).reputation_score > rep1);
     }
 
     #[test]
@@ -809,12 +799,7 @@ mod tests {
         let (_admin, client) = setup(&env);
         let attacker = Address::generate(&env);
         let victim = Address::generate(&env);
-        client.register_issuer(
-            &attacker,
-            &victim,
-            &String::from_str(&env, "Fake"),
-            &50u32,
-        );
+        client.register_issuer(&attacker, &victim, &String::from_str(&env, "Fake"), &50u32);
     }
 
     #[test]
