@@ -400,7 +400,7 @@ impl StellarIdContract {
         if additional_seconds <= 0 {
             panic!("Additional seconds must be greater than zero");
         }
-        
+
         if credential.expires_at == 0 {
             panic!("Cannot renew a non-expiring credential");
         }
