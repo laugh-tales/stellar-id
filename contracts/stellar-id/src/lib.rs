@@ -50,6 +50,16 @@ pub struct Identity {
     pub created_at: u64,
 }
 
+/// A pending request to transfer a credential to a new subject address
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TransferRequest {
+    pub credential_id: u64,
+    pub from: Address,
+    pub to: Address,
+    pub requested_at: u64,
+}
+
 /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -64,6 +74,8 @@ pub enum DataKey {
     SubjectCredentials(Address),
     // authorized sub-issuers: (parent_issuer, sub_issuer) -> bool
     SubIssuer(Address, Address),
+    // credential_id -> pending TransferRequest
+    TransferRequest(u64),
 }
 
 // ============================================================
@@ -383,6 +395,166 @@ impl StellarIdContract {
     }
 
     // --------------------------------------------------------
+    // Credential Transfer
+    // --------------------------------------------------------
+
+    /// Subject proposes transferring a credential to a new address (step 1 of 2)
+    pub fn propose_transfer(
+        env: Env,
+        subject: Address,
+        credential_id: u64,
+        new_address: Address,
+    ) {
+        subject.require_auth();
+
+        let credential: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+
+        assert!(
+            credential.subject == subject,
+            "Only the credential subject can propose a transfer"
+        );
+        assert!(!credential.revoked, "Cannot transfer a revoked credential");
+        assert!(
+            new_address != subject,
+            "Cannot transfer to the same address"
+        );
+
+        let request = TransferRequest {
+            credential_id,
+            from: subject.clone(),
+            to: new_address.clone(),
+            requested_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TransferRequest(credential_id), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "credential_transfer_proposed"),),
+            (credential_id, subject, new_address),
+        );
+    }
+
+    /// Issuer countersigns and executes a pending credential transfer (step 2 of 2)
+    pub fn approve_transfer(env: Env, issuer: Address, credential_id: u64) {
+        issuer.require_auth();
+
+        let mut credential: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+
+        assert!(
+            credential.issuer == issuer,
+            "Only the original issuer can approve the transfer"
+        );
+
+        let request: TransferRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferRequest(credential_id))
+            .expect("No pending transfer request");
+
+        let from = request.from.clone();
+        let to = request.to.clone();
+
+        // Repoint the credential to the new subject
+        credential.subject = to.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Credential(credential_id), &credential);
+
+        // Remove credential_id from sender's list
+        let from_creds: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubjectCredentials(from.clone()))
+            .unwrap_or(Vec::new(&env));
+        let mut new_from_creds = Vec::new(&env);
+        for cid in from_creds.iter() {
+            if cid != credential_id {
+                new_from_creds.push_back(cid);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubjectCredentials(from.clone()), &new_from_creds);
+
+        // Add credential_id to receiver's list
+        let mut to_creds: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubjectCredentials(to.clone()))
+            .unwrap_or(Vec::new(&env));
+        to_creds.push_back(credential_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubjectCredentials(to.clone()), &to_creds);
+
+        // Fetch the issuer's trust level for reputation recomputation
+        let trust_level = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+            .map(|r| r.trust_level)
+            .unwrap_or(0);
+
+        // Decrement sender's identity credential count
+        if let Some(mut from_identity) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Identity>(&DataKey::Identity(from.clone()))
+        {
+            if from_identity.credential_count > 0 {
+                from_identity.credential_count -= 1;
+            }
+            from_identity.reputation_score =
+                Self::compute_reputation(from_identity.credential_count, trust_level);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Identity(from.clone()), &from_identity);
+        }
+
+        // Create or update receiver's identity
+        let now = env.ledger().timestamp();
+        let to_identity = if let Some(mut id) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Identity>(&DataKey::Identity(to.clone()))
+        {
+            id.credential_count += 1;
+            id.reputation_score = Self::compute_reputation(id.credential_count, trust_level);
+            id
+        } else {
+            Identity {
+                subject: to.clone(),
+                credential_count: 1,
+                reputation_score: trust_level / 10,
+                created_at: now,
+            }
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Identity(to.clone()), &to_identity);
+
+        // Clear the pending request now that it is fulfilled
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TransferRequest(credential_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "credential_transfer_approved"),),
+            (credential_id, from, to),
+        );
+    }
+
+    // --------------------------------------------------------
     // Query Functions
     // --------------------------------------------------------
 
@@ -502,6 +674,14 @@ impl StellarIdContract {
             .instance()
             .get(&DataKey::SchemaCount)
             .unwrap_or(0)
+    }
+
+    /// Get a pending transfer request for a credential
+    pub fn get_transfer_request(env: Env, credential_id: u64) -> TransferRequest {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TransferRequest(credential_id))
+            .expect("No pending transfer request")
     }
 
     /// Check if an address is an authorized sub-issuer for a parent
@@ -1050,6 +1230,109 @@ mod tests {
 
         // Issuer credential_count reflects the full batch
         assert_eq!(client.get_issuer(&issuer).credential_count, 3);
+    }
+
+    #[test]
+    fn test_transfer_credential_happy_path() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+
+        // Step 1: subject proposes the transfer
+        client.propose_transfer(&subject, &cred_id, &new_owner);
+        let req = client.get_transfer_request(&cred_id);
+        assert_eq!(req.from, subject);
+        assert_eq!(req.to, new_owner);
+        assert_eq!(req.credential_id, cred_id);
+
+        // Step 2: issuer approves
+        client.approve_transfer(&issuer, &cred_id);
+
+        // Credential now belongs to new_owner
+        let cred = client.get_credential(&cred_id);
+        assert_eq!(cred.subject, new_owner);
+
+        // SubjectCredentials updated correctly
+        assert_eq!(client.get_subject_credentials(&subject).len(), 0);
+        assert_eq!(client.get_subject_credentials(&new_owner).len(), 1);
+
+        // Validity queries reflect the new owner
+        assert!(!client.has_valid_credential(&subject, &schema_id));
+        assert!(client.has_valid_credential(&new_owner, &schema_id));
+
+        // Transfer request was cleared
+        env.as_contract(&client.address, || {
+            let pending: Option<TransferRequest> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TransferRequest(cred_id));
+            assert!(pending.is_none());
+        });
+    }
+
+    #[test]
+    fn test_transfer_updates_identity_records() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        assert_eq!(client.get_identity(&subject).credential_count, 1);
+
+        client.propose_transfer(&subject, &cred_id, &new_owner);
+        client.approve_transfer(&issuer, &cred_id);
+
+        // Sender lost the credential from their count
+        assert_eq!(client.get_identity(&subject).credential_count, 0);
+
+        // Receiver gained a new identity record with the credential
+        let new_identity = client.get_identity(&new_owner);
+        assert_eq!(new_identity.credential_count, 1);
+        assert_eq!(new_identity.subject, new_owner);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the credential subject can propose a transfer")]
+    fn test_non_subject_cannot_propose() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        client.propose_transfer(&attacker, &cred_id, &new_owner);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the original issuer can approve the transfer")]
+    fn test_non_issuer_cannot_approve() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        client.propose_transfer(&subject, &cred_id, &new_owner);
+        client.approve_transfer(&attacker, &cred_id);
     }
 
     #[test]
