@@ -391,12 +391,15 @@ impl StellarIdContract {
             .get(&DataKey::Credential(credential_id))
             .expect("Credential not found");
 
-        assert!(
-            credential.issuer == issuer,
-            "Only the original issuer can renew"
-        );
-        assert!(!credential.revoked, "Cannot renew a revoked credential");
-        assert!(additional_seconds > 0, "Additional seconds must be greater than zero");
+        if credential.issuer != issuer {
+            panic!("Only the original issuer can renew");
+        }
+        if credential.revoked {
+            panic!("Cannot renew a revoked credential");
+        }
+        if additional_seconds <= 0 {
+            panic!("Additional seconds must be greater than zero");
+        }
         
         if credential.expires_at == 0 {
             panic!("Cannot renew a non-expiring credential");
