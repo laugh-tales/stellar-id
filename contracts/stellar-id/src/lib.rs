@@ -233,6 +233,31 @@ impl StellarIdContract {
         schema_id
     }
 
+    /// Deactivate a schema (original issuer only). Prevents new credentials from being issued.
+    /// Existing credentials remain valid.
+    pub fn deactivate_schema(env: Env, issuer: Address, schema_id: u32) {
+        issuer.require_auth();
+
+        let mut schema: Schema = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schema(schema_id))
+            .expect("Schema not found");
+
+        assert!(schema.issuer == issuer, "Only the original issuer can deactivate this schema");
+        assert!(schema.active, "Schema is already inactive");
+
+        schema.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schema(schema_id), &schema);
+
+        env.events().publish(
+            (Symbol::new(&env, "schema_deactivated"),),
+            (schema_id, issuer),
+        );
+    }
+
     // --------------------------------------------------------
     // Credential Issuance
     // --------------------------------------------------------
@@ -815,5 +840,63 @@ mod tests {
 
         let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
         client.revoke_credential(&attacker, &cred_id);
+    }
+
+    #[test]
+    fn test_deactivate_schema() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+
+        assert!(client.get_schema(&schema_id).active);
+        client.deactivate_schema(&issuer, &schema_id);
+        assert!(!client.get_schema(&schema_id).active);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the original issuer can deactivate this schema")]
+    fn test_non_owner_cannot_deactivate_schema() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let other_issuer = register_issuer_helper(&env, &client, &admin);
+
+        client.deactivate_schema(&other_issuer, &schema_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Schema is not active")]
+    fn test_issue_credential_against_inactive_schema_panics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.deactivate_schema(&issuer, &schema_id);
+        client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+    }
+
+    #[test]
+    fn test_existing_credentials_remain_valid_after_schema_deactivation() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+
+        client.deactivate_schema(&issuer, &schema_id);
+
+        // Existing credential is still valid
+        assert!(client.has_valid_credential(&subject, &schema_id));
+        let cred = client.get_credential(&cred_id);
+        assert!(!cred.revoked);
     }
 }
