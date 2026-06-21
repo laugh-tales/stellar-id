@@ -29,6 +29,19 @@ cargo test
 
 All tests must pass before you begin working on an issue.
 
+## Makefile Shortcuts
+
+Use the project Makefile for common development tasks:
+
+| Command | Description |
+|---|---|
+| `make test` | Run `cargo test` |
+| `make build` | Build the contract for `wasm32-unknown-unknown` in release mode |
+| `make fmt` | Format the workspace with `cargo fmt --all` |
+| `make lint` | Run `cargo clippy --workspace -- -D warnings` |
+| `make check` | Run `make fmt`, `make lint`, and `make test` in order |
+| `make deploy` | Run `scripts/deploy.sh` |
+
 ## Workflow
 
 1. Comment on the issue you want to work on — wait to be assigned before starting
