@@ -244,7 +244,10 @@ impl StellarIdContract {
             .get(&DataKey::Schema(schema_id))
             .expect("Schema not found");
 
-        assert!(schema.issuer == issuer, "Only the original issuer can deactivate this schema");
+        assert!(
+            schema.issuer == issuer,
+            "Only the original issuer can deactivate this schema"
+        );
         assert!(schema.active, "Schema is already inactive");
 
         schema.active = false;
@@ -684,6 +687,54 @@ mod tests {
         client.issue_credential(&issuer, &subject, &schema_id, &500u64);
         env.ledger().set_timestamp(2000);
         assert!(!client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_has_valid_credential_expires_at_now_boundary() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64);
+        env.ledger().set_timestamp(1500);
+
+        assert!(!client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_non_expiring_credential_indefinite() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        assert_eq!(client.get_credential(&cred_id).expires_at, 0);
+
+        env.ledger().set_timestamp(10_000_000);
+
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_multiple_credentials_same_schema_one_expired_one_valid() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.issue_credential(&issuer, &subject, &schema_id, &100u64);
+        env.ledger().set_timestamp(1200);
+        client.issue_credential(&issuer, &subject, &schema_id, &500u64);
+
+        assert!(client.has_valid_credential(&subject, &schema_id));
     }
 
     #[test]
