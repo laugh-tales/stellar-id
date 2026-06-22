@@ -1,4 +1,4 @@
-.PHONY: build test fmt lint deploy clean
+.PHONY: build test fmt lint check deploy clean
 
 build:
 	cargo build --target wasm32-unknown-unknown --release
