@@ -79,7 +79,13 @@ impl StellarIdContract {
     // Admin
     // --------------------------------------------------------
 
-    /// Initialize the contract with an admin address
+    /// Initializes contract instance storage with the admin address and zeroed
+    /// credential and schema counters.
+    ///
+    /// The `admin` address must authorize the call and is stored as the only
+    /// address allowed to perform admin-only issuer management actions.
+    ///
+    /// Panics if authorization for `admin` is not present.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -93,7 +99,15 @@ impl StellarIdContract {
     // Issuer Management
     // --------------------------------------------------------
 
-    /// Register a new issuer (admin only)
+    /// Registers a new issuer record.
+    ///
+    /// The stored contract admin must sign through `admin`. The new `issuer`
+    /// address is recorded with a display `name`, an active status, zero issued
+    /// credentials, and a `trust_level` in the inclusive range `1..=100`.
+    ///
+    /// Panics if the contract has not been initialized, `admin` is not the
+    /// stored admin, `admin` does not authorize the call, or `trust_level` is
+    /// outside the accepted range.
     pub fn register_issuer(
         env: Env,
         admin: Address,
@@ -129,7 +143,15 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_registered"),), (issuer,));
     }
 
-    /// Deactivate an issuer (admin only)
+    /// Deactivates an issuer record.
+    ///
+    /// The stored contract admin must sign through `admin`. The target `issuer`
+    /// remains in storage, but its `active` flag is set to `false`, preventing
+    /// future credential issuance by that issuer.
+    ///
+    /// Panics if the contract has not been initialized, `admin` is not the
+    /// stored admin, `admin` does not authorize the call, or `issuer` is not
+    /// registered.
     pub fn deactivate_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -154,7 +176,13 @@ impl StellarIdContract {
             .publish((Symbol::new(&env, "issuer_deactivated"),), (issuer,));
     }
 
-    /// Authorize a sub-issuer to issue credentials on behalf of a parent issuer
+    /// Authorizes a sub-issuer relationship for a registered parent issuer.
+    ///
+    /// The `parent` issuer must authorize the call. The `sub_issuer` address is
+    /// marked as authorized under the `(parent, sub_issuer)` storage key.
+    ///
+    /// Panics if `parent` does not authorize the call or is not a registered
+    /// issuer.
     pub fn authorize_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         let _issuer_record: Issuer = env
@@ -174,7 +202,13 @@ impl StellarIdContract {
         );
     }
 
-    /// Revoke a sub-issuer authorization
+    /// Revokes a sub-issuer relationship for a parent issuer.
+    ///
+    /// The `parent` address must authorize the call. The `(parent, sub_issuer)`
+    /// storage key is retained with a `false` value so later queries return
+    /// unauthorized.
+    ///
+    /// Panics if `parent` does not authorize the call.
     pub fn revoke_sub_issuer(env: Env, parent: Address, sub_issuer: Address) {
         parent.require_auth();
         env.storage().persistent().set(
@@ -192,7 +226,14 @@ impl StellarIdContract {
     // Schema Management
     // --------------------------------------------------------
 
-    /// Register a new credential schema (issuers only)
+    /// Registers a new active credential schema owned by an issuer.
+    ///
+    /// The `issuer` address must authorize the call and must already be an
+    /// active registered issuer. The `name` and `description` describe the
+    /// credential type. Returns the newly assigned schema identifier.
+    ///
+    /// Panics if `issuer` does not authorize the call, is not registered, is
+    /// inactive, or if `name` is empty.
     pub fn register_schema(env: Env, issuer: Address, name: String, description: String) -> u32 {
         issuer.require_auth();
         let issuer_record: Issuer = env
@@ -233,8 +274,15 @@ impl StellarIdContract {
         schema_id
     }
 
-    /// Deactivate a schema (original issuer only). Prevents new credentials from being issued.
-    /// Existing credentials remain valid.
+    /// Deactivates a credential schema owned by the original issuer.
+    ///
+    /// The `issuer` address must authorize the call and must match the stored
+    /// schema owner. Deactivation prevents new credentials from being issued for
+    /// `schema_id`; existing credentials remain valid until revoked or expired.
+    ///
+    /// Panics if `issuer` does not authorize the call, `schema_id` does not
+    /// exist, `issuer` is not the schema owner, or the schema is already
+    /// inactive.
     pub fn deactivate_schema(env: Env, issuer: Address, schema_id: u32) {
         issuer.require_auth();
 
@@ -244,7 +292,10 @@ impl StellarIdContract {
             .get(&DataKey::Schema(schema_id))
             .expect("Schema not found");
 
-        assert!(schema.issuer == issuer, "Only the original issuer can deactivate this schema");
+        assert!(
+            schema.issuer == issuer,
+            "Only the original issuer can deactivate this schema"
+        );
         assert!(schema.active, "Schema is already inactive");
 
         schema.active = false;
@@ -262,7 +313,17 @@ impl StellarIdContract {
     // Credential Issuance
     // --------------------------------------------------------
 
-    /// Issue a credential to a subject
+    /// Issues a new credential to a subject address.
+    ///
+    /// The `issuer` address must authorize the call, be registered, and be
+    /// active. The credential references `schema_id`, belongs to `subject`, and
+    /// expires after `duration_seconds` when that value is non-zero. A
+    /// `duration_seconds` value of `0` creates a non-expiring credential.
+    ///
+    /// Returns the newly assigned credential identifier.
+    ///
+    /// Panics if `issuer` does not authorize the call, is not registered, is
+    /// inactive, `schema_id` does not exist, or the schema is inactive.
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -373,7 +434,15 @@ impl StellarIdContract {
         credential_id
     }
 
-    /// Revoke a credential (issuer only)
+    /// Revokes a credential issued by the caller.
+    ///
+    /// The `issuer` address must authorize the call and must be the original
+    /// issuer stored on `credential_id`. Revocation sets the credential's
+    /// `revoked` flag to `true`.
+    ///
+    /// Panics if `issuer` does not authorize the call, `credential_id` does not
+    /// exist, `issuer` is not the original issuer, or the credential is already
+    /// revoked.
     pub fn revoke_credential(env: Env, issuer: Address, credential_id: u64) {
         issuer.require_auth();
 
@@ -404,7 +473,15 @@ impl StellarIdContract {
     // Query Functions
     // --------------------------------------------------------
 
-    /// Check if a subject has a valid (non-revoked, non-expired) credential for a schema
+    /// Returns whether a subject has at least one valid credential for a schema.
+    ///
+    /// A credential is considered valid when it belongs to `subject`, references
+    /// `schema_id`, is not revoked, and is either non-expiring or has an
+    /// `expires_at` value greater than the current ledger timestamp.
+    ///
+    /// Returns `false` when the subject has no credentials or no matching valid
+    /// credential. This query does not require authorization and does not panic
+    /// for missing subject credential storage.
     pub fn has_valid_credential(env: Env, subject: Address, schema_id: u32) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -435,7 +512,15 @@ impl StellarIdContract {
         false
     }
 
-    /// Check if a subject has any valid credential from a specific issuer
+    /// Returns whether a subject has any valid credential from an issuer.
+    ///
+    /// A credential is considered valid when it belongs to `subject`, was issued
+    /// by `issuer`, is not revoked, and is either non-expiring or has an
+    /// `expires_at` value greater than the current ledger timestamp.
+    ///
+    /// Returns `false` when the subject has no credentials or no valid
+    /// credential from `issuer`. This query does not require authorization and
+    /// does not panic for missing subject credential storage.
     pub fn has_credential_from_issuer(env: Env, subject: Address, issuer: Address) -> bool {
         let creds: Vec<u64> = match env
             .storage()
@@ -466,7 +551,9 @@ impl StellarIdContract {
         false
     }
 
-    /// Get a credential by ID
+    /// Returns a credential by identifier.
+    ///
+    /// Panics if `credential_id` does not exist.
     pub fn get_credential(env: Env, credential_id: u64) -> Credential {
         env.storage()
             .persistent()
@@ -474,7 +561,9 @@ impl StellarIdContract {
             .expect("Credential not found")
     }
 
-    /// Get an identity profile
+    /// Returns the identity profile for a subject address.
+    ///
+    /// Panics if no identity has been created for `subject`.
     pub fn get_identity(env: Env, subject: Address) -> Identity {
         env.storage()
             .persistent()
@@ -482,7 +571,9 @@ impl StellarIdContract {
             .expect("Identity not found")
     }
 
-    /// Get an issuer record
+    /// Returns an issuer record by address.
+    ///
+    /// Panics if `issuer` is not registered.
     pub fn get_issuer(env: Env, issuer: Address) -> Issuer {
         env.storage()
             .persistent()
@@ -490,7 +581,9 @@ impl StellarIdContract {
             .expect("Issuer not found")
     }
 
-    /// Get a schema by ID
+    /// Returns a credential schema by identifier.
+    ///
+    /// Panics if `schema_id` does not exist.
     pub fn get_schema(env: Env, schema_id: u32) -> Schema {
         env.storage()
             .persistent()
@@ -498,7 +591,11 @@ impl StellarIdContract {
             .expect("Schema not found")
     }
 
-    /// Get all credential IDs for a subject
+    /// Returns all credential identifiers recorded for a subject.
+    ///
+    /// Returns an empty vector when `subject` has no credentials. This query
+    /// does not require authorization and does not panic for missing subject
+    /// credential storage.
     pub fn get_subject_credentials(env: Env, subject: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -506,7 +603,9 @@ impl StellarIdContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get total credential count
+    /// Returns the total number of credentials issued by the contract.
+    ///
+    /// Returns `0` when the counter has not been initialized.
     pub fn get_credential_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -514,7 +613,9 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Get total schema count
+    /// Returns the total number of schemas registered by the contract.
+    ///
+    /// Returns `0` when the counter has not been initialized.
     pub fn get_schema_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -522,7 +623,11 @@ impl StellarIdContract {
             .unwrap_or(0)
     }
 
-    /// Check if an address is an authorized sub-issuer for a parent
+    /// Returns whether `sub_issuer` is authorized under `parent`.
+    ///
+    /// Returns `false` when no authorization record exists or when the
+    /// relationship was explicitly revoked. This query does not require
+    /// authorization.
     pub fn is_sub_issuer(env: Env, parent: Address, sub_issuer: Address) -> bool {
         env.storage()
             .persistent()
