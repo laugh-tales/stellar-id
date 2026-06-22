@@ -28,16 +28,19 @@ soroban-sdk = { version = "21.7.6", features = [] }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.7.6", features = ["testutils"] }
+stellar-id = { path = "../stellar-id" }
 ```
 
 #### 2. src/lib.rs
 
 ```rust
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contractclient, Address, Env, String, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contractclient, Address, Env};
 
+// ── External contract interface ─────────────────────────────────────────
+// #[contractclient] generates `StellarIdClient` — a cross-contract caller
+// that wraps env.invoke_contract(). The trait methods must match the exact
+// signatures of the StellarID contract's public functions.
 #[contractclient(name = "StellarIdClient")]
 trait StellarId {
     fn has_valid_credential(env: Env, subject: Address, schema_id: u32) -> bool;
@@ -45,6 +48,9 @@ trait StellarId {
     fn get_identity(env: Env, subject: Address) -> Identity;
 }
 
+// The Identity type must be replicated so the generated client can decode
+// the cross-contract return value. Keep this in sync with the StellarID
+// contract definition.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Identity {
@@ -54,6 +60,16 @@ pub struct Identity {
     pub created_at: u64,
 }
 
+// ── Storage keys ────────────────────────────────────────────────────────
+#[contracttype]
+enum DataKey {
+    Admin,
+    StellarIdContract,
+    KycSchemaId,
+    Balance(Address),
+}
+
+// ── Gated Vault contract ────────────────────────────────────────────────
 #[contract]
 pub struct GatedVault;
 
@@ -90,20 +106,13 @@ impl GatedVault {
     fn assert_kyc_verified(env: &Env, user: &Address) {
         let stellar_id_contract: Address = env.storage().instance().get(&DataKey::StellarIdContract).expect("Not initialized");
         let kyc_schema_id: u32 = env.storage().instance().get(&DataKey::KycSchemaId).expect("Not initialized");
+        // Build a cross-contract client and call has_valid_credential
         let client = StellarIdClient::new(env, &stellar_id_contract);
         assert!(
             client.has_valid_credential(user, &kyc_schema_id),
             "User must have a valid KYC credential"
         );
     }
-}
-
-#[contracttype]
-enum DataKey {
-    Admin,
-    StellarIdContract,
-    KycSchemaId,
-    Balance(Address),
 }
 
 #[cfg(test)]
@@ -175,33 +184,115 @@ The test code above shows a complete example.
 
 ## Backend / SDK Call
 
-From a TypeScript backend using the Stellar SDK:
+From a TypeScript backend using the Stellar SDK, you can verify credentials via `simulateTransaction` — no wallet or user signature is required since `has_valid_credential` is read-only.
+
+### Prerequisites
+
+```bash
+npm install @stellar/stellar-sdk
+```
+
+### Complete Example
 
 ```typescript
-import { Contract, SorobanRpc, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
+import {
+  Address,
+  Contract,
+  Keypair,
+  nativeToScVal,
+  Networks,
+  scvalToNative,
+  SorobanRpc,
+  TransactionBuilder,
+} from "@stellar/stellar-sdk";
 
-const server = new SorobanRpc.Server("https://soroban-testnet.stellar.org");
-const STELLAR_ID_CONTRACT = "YOUR_CONTRACT_ID";
+const RPC_URL = "https://soroban-testnet.stellar.org";
+const STELLAR_ID_CONTRACT_ID = "CA3D..."; // Deployed contract ID
 
+const server = new SorobanRpc.Server(RPC_URL);
+const networkPassphrase = Networks.TESTNET;
+
+/**
+ * Check whether a subject address holds a valid credential for a given schema.
+ *
+ * This is a pure simulate call — no fees, no signatures, no on-chain footprint.
+ */
 async function hasValidCredential(
   subjectAddress: string,
-  schemaId: number
+  schemaId: number,
 ): Promise<boolean> {
-  const contract = new Contract(STELLAR_ID_CONTRACT);
+  const contract = new Contract(STELLAR_ID_CONTRACT_ID);
 
-  const result = await server.simulateTransaction(
-    new TransactionBuilder(/* ... */)
-      .addOperation(
-        contract.call(
-          "has_valid_credential",
-          // encode subject and schema_id as XDR args
-        )
-      )
-      .build()
-  );
+  const subjectScVal = Address.fromString(subjectAddress).toScVal();
+  const schemaIdScVal = nativeToScVal(schemaId, { type: "u32" });
 
-  return result.result?.retval?.value() === true;
+  // A random keypair is fine for simulation — the source account is never
+  // charged because the transaction is never submitted.
+  const source = Keypair.random();
+
+  const tx = new TransactionBuilder(source, {
+    fee: "100",
+    networkPassphrase,
+  })
+    .addOperation(
+      contract.call("has_valid_credential", subjectScVal, schemaIdScVal),
+    )
+    .setTimeout(30)
+    .build();
+
+  const result = await server.simulateTransaction(tx);
+
+  if (result.error) {
+    throw new Error(`Simulation failed: ${result.error}`);
+  }
+
+  const retval = result.result?.retval;
+  if (!retval) {
+    throw new Error("No return value — check contract ID and network");
+  }
+
+  return scvalToNative(retval) as boolean;
 }
+```
+
+### Usage
+
+```typescript
+const isVerified = await hasValidCredential(
+  "GBPLP3Y3TPF6T3Q5KNHX6PRFGKELN33NX2K5C4YKP32Y36B6H5XJ7GKL",
+  1, // KYC Verified schema
+);
+
+if (isVerified) {
+  console.log("User is KYC-verified, granting access");
+} else {
+  console.log("User does not have a valid KYC credential");
+}
+```
+
+### Express Middleware Example
+
+```typescript
+import express from "express";
+
+const app = express();
+
+app.use(async (req, res, next) => {
+  const userAddress = req.headers["x-stellar-address"] as string;
+  if (!userAddress) {
+    return res.status(401).json({ error: "Missing x-stellar-address header" });
+  }
+
+  try {
+    const isVerified = await hasValidCredential(userAddress, 1);
+    if (!isVerified) {
+      return res.status(403).json({ error: "KYC verification required" });
+    }
+    next();
+  } catch (err) {
+    return res.status(500).json({ error: "Verification check failed" });
+  }
+});
 ```
 
 ## Common Schema IDs
