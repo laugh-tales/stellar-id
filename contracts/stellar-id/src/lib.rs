@@ -332,27 +332,8 @@ impl StellarIdContract {
         duration_seconds: u64,
     ) -> u64 {
         issuer.require_auth();
-
-        let issuer_record: Option<Issuer> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Issuer(issuer.clone()));
-
-        let effective_trust: u32;
-
-        if let Some(record) = issuer_record {
-            assert!(record.active, "Issuer is not active");
-            effective_trust = record.trust_level;
-        } else {
-            panic!("Not a registered issuer");
-        }
-
-        let schema: Schema = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Schema(schema_id))
-            .expect("Schema not found");
-        assert!(schema.active, "Schema is not active");
+        let effective_trust = Self::require_active_issuer(&env, &issuer);
+        Self::require_active_schema(&env, schema_id);
 
         let now = env.ledger().timestamp();
         let expires_at = if duration_seconds > 0 {
@@ -432,6 +413,117 @@ impl StellarIdContract {
         );
 
         credential_id
+    }
+
+    /// Issues credentials to multiple subjects in a single call.
+    ///
+    /// The `issuer` address must authorize the call once; all `subjects` receive
+    /// a credential for `schema_id` with the same expiry. Returns credential IDs
+    /// in the same order as the input subjects list.
+    ///
+    /// Panics if `issuer` does not authorize the call, is not registered, is
+    /// inactive, `schema_id` does not exist, the schema is inactive, or the
+    /// subjects list is empty.
+    pub fn batch_issue_credentials(
+        env: Env,
+        issuer: Address,
+        subjects: Vec<Address>,
+        schema_id: u32,
+        duration_seconds: u64,
+    ) -> Vec<u64> {
+        issuer.require_auth();
+        assert!(!subjects.is_empty(), "subjects list cannot be empty");
+        let effective_trust = Self::require_active_issuer(&env, &issuer);
+        Self::require_active_schema(&env, schema_id);
+
+        let now = env.ledger().timestamp();
+        let expires_at = if duration_seconds > 0 {
+            now + duration_seconds
+        } else {
+            0
+        };
+
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CredentialCount)
+            .unwrap_or(0);
+
+        let mut credential_ids: Vec<u64> = Vec::new(&env);
+
+        for subject in subjects.iter() {
+            count += 1;
+            let credential_id = count;
+
+            let credential = Credential {
+                id: credential_id,
+                subject: subject.clone(),
+                issuer: issuer.clone(),
+                schema_id,
+                issued_at: now,
+                expires_at,
+                revoked: false,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Credential(credential_id), &credential);
+
+            let mut subject_creds: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SubjectCredentials(subject.clone()))
+                .unwrap_or(Vec::new(&env));
+            subject_creds.push_back(credential_id);
+            env.storage().persistent().set(
+                &DataKey::SubjectCredentials(subject.clone()),
+                &subject_creds,
+            );
+
+            let existing: Option<Identity> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Identity(subject.clone()));
+            let identity = if let Some(mut id) = existing {
+                id.credential_count += 1;
+                id.reputation_score =
+                    Self::compute_reputation(id.credential_count, effective_trust);
+                id
+            } else {
+                Identity {
+                    subject: subject.clone(),
+                    credential_count: 1,
+                    reputation_score: effective_trust / 10,
+                    created_at: now,
+                }
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Identity(subject.clone()), &identity);
+
+            credential_ids.push_back(credential_id);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialCount, &count);
+
+        let mut issuer_rec: Issuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()))
+            .expect("Issuer not found");
+        issuer_rec.credential_count += subjects.len() as u64;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+
+        env.events().publish(
+            (Symbol::new(&env, "credentials_batch_issued"),),
+            (subjects.len(), issuer, schema_id),
+        );
+
+        credential_ids
     }
 
     /// Revokes a credential issued by the caller.
@@ -639,6 +731,28 @@ impl StellarIdContract {
     // Internal helpers
     // --------------------------------------------------------
 
+    fn require_active_issuer(env: &Env, issuer: &Address) -> u32 {
+        let issuer_record: Option<Issuer> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()));
+        if let Some(record) = issuer_record {
+            assert!(record.active, "Issuer is not active");
+            record.trust_level
+        } else {
+            panic!("Not a registered issuer");
+        }
+    }
+
+    fn require_active_schema(env: &Env, schema_id: u32) {
+        let schema: Schema = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schema(schema_id))
+            .expect("Schema not found");
+        assert!(schema.active, "Schema is not active");
+    }
+
     fn compute_reputation(credential_count: u32, trust_level: u32) -> u32 {
         let base = credential_count * 10;
         let trust_bonus = trust_level / 10;
@@ -654,8 +768,8 @@ impl StellarIdContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        Address, Env, String,
+        testutils::{Address as _, Events, Ledger},
+        Address, Env, String, Vec,
     };
 
     fn setup(env: &Env) -> (Address, StellarIdContractClient<'_>) {
@@ -1102,5 +1216,145 @@ mod tests {
         let attacker = Address::generate(&env);
         let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
         client.revoke_credential(&attacker, &cred_id);
+    }
+
+    // --------------------------------------------------------
+    // Batch credential issuance tests
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_batch_issue_credentials() {
+        let env = Env::default();
+        env.ledger().set_timestamp(2000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+
+        let mut subjects: Vec<Address> = Vec::new(&env);
+        subjects.push_back(Address::generate(&env));
+        subjects.push_back(Address::generate(&env));
+        subjects.push_back(Address::generate(&env));
+
+        let event_count_before = env.events().all().len();
+
+        let ids = client.batch_issue_credentials(&issuer, &subjects, &schema_id, &0u64);
+
+        let event_count_after = env.events().all().len();
+
+        // Returns sequential IDs
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.get(0).unwrap(), 1);
+        assert_eq!(ids.get(1).unwrap(), 2);
+        assert_eq!(ids.get(2).unwrap(), 3);
+
+        assert_eq!(client.get_credential_count(), 3);
+
+        // Each credential has correct data
+        for (i, subject) in subjects.iter().enumerate() {
+            let cred = client.get_credential(&ids.get(i as u32).unwrap());
+            assert_eq!(cred.subject, subject);
+            assert_eq!(cred.issuer, issuer);
+            assert_eq!(cred.schema_id, schema_id);
+            assert!(!cred.revoked);
+            assert_eq!(cred.expires_at, 0);
+        }
+
+        // Each subject has an identity
+        for subject in subjects.iter() {
+            let identity = client.get_identity(&subject);
+            assert_eq!(identity.credential_count, 1);
+            assert_eq!(identity.created_at, 2000);
+        }
+
+        // Issuer credential count updated
+        let issuer_record = client.get_issuer(&issuer);
+        assert_eq!(issuer_record.credential_count, 3);
+
+        // Batch event was emitted
+        assert!(
+            event_count_after > event_count_before,
+            "batch event should have been emitted"
+        );
+    }
+
+    #[test]
+    fn test_batch_issue_credentials_with_expiry() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+
+        let mut subjects: Vec<Address> = Vec::new(&env);
+        subjects.push_back(Address::generate(&env));
+        subjects.push_back(Address::generate(&env));
+
+        let ids = client.batch_issue_credentials(&issuer, &subjects, &schema_id, &3600u64);
+
+        for i in 0..ids.len() {
+            let cred = client.get_credential(&ids.get(i).unwrap());
+            assert_eq!(cred.expires_at, 4600);
+        }
+    }
+
+    #[test]
+    fn test_batch_issue_credentials_updates_multiple_identities() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let s1 = register_schema_helper(&env, &client, &issuer);
+        let s2 = client.register_schema(
+            &issuer,
+            &String::from_str(&env, "Accredited Investor"),
+            &String::from_str(&env, "Accredited investor status"),
+        );
+
+        let mut subjects: Vec<Address> = Vec::new(&env);
+        subjects.push_back(Address::generate(&env));
+        subjects.push_back(Address::generate(&env));
+
+        // Issue KYC to subject 0, both schemas to subject 1
+        let mut single_subject: Vec<Address> = Vec::new(&env);
+        single_subject.push_back(subjects.get(0).unwrap());
+        client.batch_issue_credentials(&issuer, &single_subject, &s1, &0u64);
+
+        client.batch_issue_credentials(&issuer, &subjects, &s2, &0u64);
+
+        // Subject 0: two credentials (one from each batch)
+        let id0 = client.get_identity(&subjects.get(0).unwrap());
+        assert_eq!(id0.credential_count, 2);
+
+        // Subject 1: one credential
+        let id1 = client.get_identity(&subjects.get(1).unwrap());
+        assert_eq!(id1.credential_count, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Schema is not active")]
+    fn test_batch_issue_credentials_inactive_schema_panics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let mut subjects: Vec<Address> = Vec::new(&env);
+        subjects.push_back(Address::generate(&env));
+
+        client.deactivate_schema(&issuer, &schema_id);
+        client.batch_issue_credentials(&issuer, &subjects, &schema_id, &0u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "subjects list cannot be empty")]
+    fn test_batch_issue_credentials_empty_subjects_panics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subjects: Vec<Address> = Vec::new(&env);
+
+        client.batch_issue_credentials(&issuer, &subjects, &schema_id, &0u64);
     }
 }
