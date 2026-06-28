@@ -662,8 +662,9 @@ impl StellarIdContract {
             .set(&DataKey::CredentialCount, &credential_id);
 
         // Track bridged attestation
+        let evm_uid_clone = bridge_data.evm_uid.clone();
         env.storage().persistent().set(
-            &DataKey::BridgedAttestation(bridge_data.evm_chain_id, bridge_data.evm_uid),
+            &DataKey::BridgedAttestation(bridge_data.evm_chain_id, evm_uid_clone),
             &true,
         );
 
@@ -1758,9 +1759,9 @@ mod tests {
         client.register_bridge_operator(&admin, &bridge_operator);
 
         // Create bridge data
-        let evm_uid = BytesN::from_array(&[0u8; 32]);
-        let evm_attester = BytesN::from_array(&[0u8; 20]);
-        let evm_schema_uid = BytesN::from_array(&[0u8; 32]);
+        let evm_uid = BytesN::from_array(&env, &[0u8; 32]);
+        let evm_attester = BytesN::from_array(&env, &[0u8; 20]);
+        let evm_schema_uid = BytesN::from_array(&env, &[0u8; 32]);
 
         let bridge_data = BridgeAttestation {
             evm_chain_id: 1,
@@ -1800,9 +1801,9 @@ mod tests {
         let subject = Address::generate(&env);
 
         // Create bridge data
-        let evm_uid = BytesN::from_array(&[0u8; 32]);
-        let evm_attester = BytesN::from_array(&[0u8; 20]);
-        let evm_schema_uid = BytesN::from_array(&[0u8; 32]);
+        let evm_uid = BytesN::from_array(&env, &[0u8; 32]);
+        let evm_attester = BytesN::from_array(&env, &[0u8; 20]);
+        let evm_schema_uid = BytesN::from_array(&env, &[0u8; 32]);
 
         let bridge_data = BridgeAttestation {
             evm_chain_id: 1,
@@ -1838,9 +1839,9 @@ mod tests {
         client.register_bridge_operator(&admin, &bridge_operator);
 
         // Create bridge data
-        let evm_uid = BytesN::from_array(&[0u8; 32]);
-        let evm_attester = BytesN::from_array(&[0u8; 20]);
-        let evm_schema_uid = BytesN::from_array(&[0u8; 32]);
+        let evm_uid = BytesN::from_array(&env, &[0u8; 32]);
+        let evm_attester = BytesN::from_array(&env, &[0u8; 20]);
+        let evm_schema_uid = BytesN::from_array(&env, &[0u8; 32]);
 
         let bridge_data = BridgeAttestation {
             evm_chain_id: 1,
