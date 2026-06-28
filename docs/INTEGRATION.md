@@ -14,35 +14,46 @@ Here's a complete example of a gated vault contract that only lets KYC-verified 
 
 #### 1. Cargo.toml
 
+Create `examples/gated-vault/Cargo.toml`:
+
 ```toml
 [package]
 name = "gated-vault"
 version = "0.1.0"
 edition = "2021"
+description = "Example Soroban vault gated by StellarID KYC credentials"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = { version = "21.7.6", features = [] }
+soroban-sdk = { workspace = true, features = [] }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.7.6", features = ["testutils"] }
-stellar-id = { path = "../stellar-id" }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+stellar-id = { path = "../../contracts/stellar-id" }
+```
+
+Add the crate to the workspace root `Cargo.toml`:
+
+```toml
+[workspace]
+members = ["contracts/stellar-id", "examples/gated-vault"]
 ```
 
 #### 2. src/lib.rs
 
 ```rust
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contractclient, Address, Env};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env};
 
-// ── External contract interface ─────────────────────────────────────────
-// #[contractclient] generates `StellarIdClient` — a cross-contract caller
+// ── StellarIdVerifier trait ─────────────────────────────────────────────
+// #[contractclient] generates `StellarIdVerifierClient` — a cross-contract caller
 // that wraps env.invoke_contract(). The trait methods must match the exact
 // signatures of the StellarID contract's public functions.
-#[contractclient(name = "StellarIdClient")]
-trait StellarId {
+#[contractclient(name = "StellarIdVerifierClient")]
+pub trait StellarIdVerifier {
     fn has_valid_credential(env: Env, subject: Address, schema_id: u32) -> bool;
     fn has_credential_from_issuer(env: Env, subject: Address, issuer: Address) -> bool;
     fn get_identity(env: Env, subject: Address) -> Identity;
@@ -59,6 +70,9 @@ pub struct Identity {
     pub reputation_score: u32,
     pub created_at: u64,
 }
+
+/// KYC schema ID — first schema registered on a fresh StellarID deployment.
+pub const KYC_SCHEMA_ID: u32 = 1;
 
 // ── Storage keys ────────────────────────────────────────────────────────
 #[contracttype]
@@ -106,15 +120,20 @@ impl GatedVault {
     fn assert_kyc_verified(env: &Env, user: &Address) {
         let stellar_id_contract: Address = env.storage().instance().get(&DataKey::StellarIdContract).expect("Not initialized");
         let kyc_schema_id: u32 = env.storage().instance().get(&DataKey::KycSchemaId).expect("Not initialized");
-        // Build a cross-contract client and call has_valid_credential
-        let client = StellarIdClient::new(env, &stellar_id_contract);
+        let client = StellarIdVerifierClient::new(env, &stellar_id_contract);
         assert!(
             client.has_valid_credential(user, &kyc_schema_id),
             "User must have a valid KYC credential"
         );
     }
 }
+```
 
+#### 3. Tests (mock StellarID contract)
+
+Tests deploy the real `StellarIdContract` as a stand-in for the deployed StellarID instance. The full test suite lives in `examples/gated-vault/src/lib.rs`:
+
+```rust
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,50 +143,75 @@ mod tests {
     };
     use stellar_id::{StellarIdContract, StellarIdContractClient};
 
-    #[test]
-    fn test_gated_vault() {
-        let env = Env::default();
+    fn setup_vault(
+        env: &Env,
+    ) -> (
+        Address,
+        StellarIdContractClient<'_>,
+        GatedVaultClient<'_>,
+        Address,
+        u32,
+    ) {
         env.mock_all_auths();
 
-        // Deploy StellarID
-        let stellar_id_admin = Address::generate(&env);
+        let stellar_id_admin = Address::generate(env);
         let stellar_id_contract = env.register_contract(None, StellarIdContract);
-        let stellar_id_client = StellarIdContractClient::new(&env, &stellar_id_contract);
+        let stellar_id_client = StellarIdContractClient::new(env, &stellar_id_contract);
         stellar_id_client.initialize(&stellar_id_admin);
 
-        // Register issuer and schema
-        let issuer = Address::generate(&env);
-        stellar_id_client.register_issuer(&stellar_id_admin, &issuer, &String::from_str(&env, "Test Issuer"), &80u32);
-        let schema_id = stellar_id_client.register_schema(&issuer, &String::from_str(&env, "KYC Verified"), &String::from_str(&env, "KYC Credential"));
+        let issuer = Address::generate(env);
+        stellar_id_client.register_issuer(
+            &stellar_id_admin,
+            &issuer,
+            &String::from_str(env, "Test Issuer"),
+            &80u32,
+        );
+        let kyc_schema_id = stellar_id_client.register_schema(
+            &issuer,
+            &String::from_str(env, "KYC Verified"),
+            &String::from_str(env, "KYC Credential"),
+        );
+        assert_eq!(kyc_schema_id, KYC_SCHEMA_ID); // schema_id = 1
 
-        // Deploy GatedVault
-        let vault_admin = Address::generate(&env);
+        let vault_admin = Address::generate(env);
         let vault_contract = env.register_contract(None, GatedVault);
-        let vault_client = GatedVaultClient::new(&env, &vault_contract);
-        vault_client.initialize(&vault_admin, &stellar_id_contract, &schema_id);
+        let vault_client = GatedVaultClient::new(env, &vault_contract);
+        vault_client.initialize(&vault_admin, &stellar_id_contract, &kyc_schema_id);
 
-        // Test user
+        (issuer, stellar_id_client, vault_client, stellar_id_contract, kyc_schema_id)
+    }
+
+    #[test]
+    #[should_panic(expected = "User must have a valid KYC credential")]
+    fn test_deposit_rejects_non_kyc_wallet() {
+        let env = Env::default();
+        let (_, _, vault_client, _, _) = setup_vault(&env);
+        let user = Address::generate(&env);
+        vault_client.deposit(&user, &100u64); // rejected — no KYC credential
+    }
+
+    #[test]
+    fn test_deposit_accepts_kyc_wallet() {
+        let env = Env::default();
+        let (issuer, stellar_id_client, vault_client, _, kyc_schema_id) = setup_vault(&env);
         let user = Address::generate(&env);
 
-        // Deposit without KYC should fail
-        let result = std::panic::catch_unwind(|| {
-            vault_client.deposit(&user, &100u64);
-        });
-        assert!(result.is_err());
-
-        // Issue KYC credential
         env.ledger().set_timestamp(1000);
-        stellar_id_client.issue_credential(&issuer, &user, &schema_id, &0u64);
+        stellar_id_client.issue_credential(&issuer, &user, &kyc_schema_id, &0u64);
 
-        // Deposit with KYC should succeed
         vault_client.deposit(&user, &100u64);
         assert_eq!(vault_client.get_balance(&user), 100);
 
-        // Withdraw
         vault_client.withdraw(&user, &50u64);
         assert_eq!(vault_client.get_balance(&user), 50);
     }
 }
+```
+
+Run the full suite:
+
+```bash
+cargo test --workspace
 ```
 
 ### How to Test Contract-to-Contract Calls
