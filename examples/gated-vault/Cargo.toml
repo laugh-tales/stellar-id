@@ -1,0 +1,16 @@
+[package]
+name = "gated-vault"
+version = "0.1.0"
+edition = "2021"
+description = "Example Soroban vault gated by StellarID KYC credentials"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = [] }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+stellar-id = { path = "../../contracts/stellar-id" }

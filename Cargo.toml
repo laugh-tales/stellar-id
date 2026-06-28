@@ -1,5 +1,5 @@
 [workspace]
-members = ["contracts/stellar-id"]
+members = ["contracts/stellar-id", "examples/gated-vault"]
 resolver = "2"
 
 [workspace.dependencies]
