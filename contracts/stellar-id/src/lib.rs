@@ -5,6 +5,18 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 // Data Types
 // ============================================================
 
+/// Attestation data bridged from an EVM chain
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BridgeAttestation {
+    pub evm_chain_id: u64,
+    pub evm_uid: BytesN<32>,
+    pub evm_attester: BytesN<20>,
+    pub evm_schema_uid: BytesN<32>,
+    pub evm_expiry: u64,
+    pub bridge_operator: Address,
+}
+
 /// A verifiable credential issued to a subject address
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -16,19 +28,6 @@ pub struct Credential {
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
     pub revoked: bool,
-    pub bridge_metadata: Option<BridgeAttestation>,
-}
-
-/// Attestation data bridged from an EVM chain
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BridgeAttestation {
-    pub evm_chain_id: u64,
-    pub evm_uid: BytesN<32>,
-    pub evm_attester: BytesN<20>,
-    pub evm_schema_uid: BytesN<32>,
-    pub evm_expiry: u64,
-    pub bridge_operator: Address,
 }
 
 /// A credential schema defining a type of credential
@@ -83,6 +82,8 @@ pub enum DataKey {
     BridgedAttestation(u64, BytesN<32>),
     // subject -> Vec<u64> of bridged credential IDs
     SubjectBridgeCredentials(Address),
+    // credential_id -> BridgeAttestation
+    BridgeMetadata(u64),
 }
 
 // ============================================================
@@ -420,7 +421,6 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
-            bridge_metadata: None,
         };
 
         env.storage()
@@ -527,7 +527,6 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
-                bridge_metadata: None,
             };
 
             env.storage()
@@ -651,12 +650,14 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
-            bridge_metadata: Some(bridge_data.clone()),
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BridgeMetadata(credential_id), &bridge_data);
         env.storage()
             .instance()
             .set(&DataKey::CredentialCount, &credential_id);
@@ -987,6 +988,15 @@ impl StellarIdContract {
             .persistent()
             .get(&DataKey::SubIssuer(parent, sub_issuer))
             .unwrap_or(false)
+    }
+
+    /// Returns the bridge metadata for a credential, if it exists.
+    ///
+    /// Returns `None` when the credential has no bridge metadata.
+    pub fn get_bridge_metadata(env: Env, credential_id: u64) -> Option<BridgeAttestation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BridgeMetadata(credential_id))
     }
 
     // --------------------------------------------------------
@@ -1784,7 +1794,8 @@ mod tests {
         // Verify
         assert_eq!(cred_id, 1);
         let cred = client.get_credential(&cred_id);
-        assert!(cred.bridge_metadata.is_some());
+        let bridge_meta = client.get_bridge_metadata(&cred_id);
+        assert!(bridge_meta.is_some());
         assert_eq!(cred.issuer, bridge_operator);
         assert_eq!(client.get_bridge_credentials(&subject).len(), 1);
     }
@@ -1894,9 +1905,9 @@ mod tests {
         client.register_bridge_operator(&admin, &bridge_operator);
 
         // Create bridge data with expiry in past
-        let evm_uid = BytesN::from_array(&[0u8; 32]);
-        let evm_attester = BytesN::from_array(&[0u8; 20]);
-        let evm_schema_uid = BytesN::from_array(&[0u8; 32]);
+        let evm_uid = BytesN::from_array(&env, &[0u8; 32]);
+        let evm_attester = BytesN::from_array(&env, &[0u8; 20]);
+        let evm_schema_uid = BytesN::from_array(&env, &[0u8; 32]);
 
         let bridge_data = BridgeAttestation {
             evm_chain_id: 1,
@@ -1918,6 +1929,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Not an authorized bridge operator")]
     fn test_revoke_bridge_operator() {
         let env = Env::default();
         let (admin, client) = setup(&env);
@@ -1932,9 +1944,9 @@ mod tests {
         let schema_id = register_schema_helper(&env, &client, &issuer);
         let subject = Address::generate(&env);
 
-        let evm_uid = BytesN::from_array(&[0u8; 32]);
-        let evm_attester = BytesN::from_array(&[0u8; 20]);
-        let evm_schema_uid = BytesN::from_array(&[0u8; 32]);
+        let evm_uid = BytesN::from_array(&env, &[0u8; 32]);
+        let evm_attester = BytesN::from_array(&env, &[0u8; 20]);
+        let evm_schema_uid = BytesN::from_array(&env, &[0u8; 32]);
 
         let bridge_data = BridgeAttestation {
             evm_chain_id: 1,
@@ -1945,15 +1957,12 @@ mod tests {
             bridge_operator: bridge_operator.clone(),
         };
 
-        let result = std::panic::catch_unwind(|| {
-            client.bridge_credential(
-                &bridge_operator,
-                &subject,
-                &schema_id,
-                &bridge_data,
-                &0u64,
-            );
-        });
-        assert!(result.is_err());
+        client.bridge_credential(
+            &bridge_operator,
+            &subject,
+            &schema_id,
+            &bridge_data,
+            &0u64,
+        );
     }
 }
