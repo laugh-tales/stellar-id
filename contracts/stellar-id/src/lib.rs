@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec, BytesN};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 // ============================================================
 // Data Types
@@ -206,7 +208,10 @@ impl StellarIdContract {
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized");
-        assert!(admin == stored_admin, "Only admin can register bridge operators");
+        assert!(
+            admin == stored_admin,
+            "Only admin can register bridge operators"
+        );
 
         env.storage()
             .persistent()
@@ -228,16 +233,17 @@ impl StellarIdContract {
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized");
-        assert!(admin == stored_admin, "Only admin can revoke bridge operators");
+        assert!(
+            admin == stored_admin,
+            "Only admin can revoke bridge operators"
+        );
 
         env.storage()
             .persistent()
             .set(&DataKey::BridgeOperator(operator.clone()), &false);
 
-        env.events().publish(
-            (Symbol::new(&env, "bridge_operator_revoked"),),
-            (operator,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "bridge_operator_revoked"),), (operator,));
     }
 
     /// Authorizes a sub-issuer relationship for a registered parent issuer.
@@ -602,7 +608,7 @@ impl StellarIdContract {
         duration_seconds: u64,
     ) -> u64 {
         operator.require_auth();
-        
+
         // Check if operator is authorized
         let is_authorized: bool = env
             .storage()
@@ -1783,13 +1789,8 @@ mod tests {
         };
 
         // Bridge credential
-        let cred_id = client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data,
-            &0u64,
-        );
+        let cred_id =
+            client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
 
         // Verify
         assert_eq!(cred_id, 1);
@@ -1826,13 +1827,7 @@ mod tests {
         };
 
         // Try to bridge without registering operator
-        client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data,
-            &0u64,
-        );
+        client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
     }
 
     #[test]
@@ -1864,13 +1859,7 @@ mod tests {
         };
 
         // Bridge once
-        client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data,
-            &0u64,
-        );
+        client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
 
         // Bridge again (duplicate)
         let bridge_data2 = BridgeAttestation {
@@ -1881,13 +1870,7 @@ mod tests {
             evm_expiry: 0,
             bridge_operator: bridge_operator.clone(),
         };
-        client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data2,
-            &0u64,
-        );
+        client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data2, &0u64);
     }
 
     #[test]
@@ -1919,13 +1902,7 @@ mod tests {
         };
 
         // Try to bridge
-        client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data,
-            &0u64,
-        );
+        client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
     }
 
     #[test]
@@ -1957,12 +1934,6 @@ mod tests {
             bridge_operator: bridge_operator.clone(),
         };
 
-        client.bridge_credential(
-            &bridge_operator,
-            &subject,
-            &schema_id,
-            &bridge_data,
-            &0u64,
-        );
+        client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
     }
 }
