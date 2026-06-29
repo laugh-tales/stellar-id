@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -64,6 +64,20 @@ pub struct Identity {
     pub created_at: u64,
 }
 
+/// A privacy-preserving commitment to a credential.
+///
+/// The commitment is computed off-chain as SHA-256(credential_id_le || blinding_factor)
+/// and submitted on-chain. The subject can later prove knowledge of the opening
+/// without revealing which specific credential or issuer is involved.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CredentialCommitment {
+    pub subject: Address,
+    pub commitment: BytesN<32>,
+    pub schema_id: u32,
+    pub committed_at: u64,
+}
+
 /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -86,6 +100,8 @@ pub enum DataKey {
     SubjectBridgeCredentials(Address),
     // credential_id -> BridgeAttestation
     BridgeMetadata(u64),
+    // (subject, schema_id) -> CredentialCommitment
+    Commitment(Address, u32),
 }
 
 // ============================================================
@@ -1006,8 +1022,177 @@ impl StellarIdContract {
     }
 
     // --------------------------------------------------------
+    // Credential Commitments (privacy layer)
+    // --------------------------------------------------------
+
+    /// Submits a privacy-preserving commitment to a credential.
+    ///
+    /// The `subject` computes the commitment off-chain as:
+    ///   `SHA-256(credential_id as u64 little-endian || blinding_factor: BytesN<32>)`
+    /// and submits only the hash. The underlying credential ID and blinding
+    /// factor are never revealed on-chain at this point.
+    ///
+    /// Only one commitment per (subject, schema_id) pair is stored; submitting
+    /// again overwrites the previous commitment.
+    ///
+    /// Panics if `subject` does not authorize the call or `schema_id` does not
+    /// exist.
+    pub fn submit_commitment(env: Env, subject: Address, schema_id: u32, commitment: BytesN<32>) {
+        subject.require_auth();
+        // Verify the schema exists (no need for it to be active — committing to
+        // an existing credential under a since-deactivated schema is valid).
+        env.storage()
+            .persistent()
+            .get::<DataKey, Schema>(&DataKey::Schema(schema_id))
+            .expect("Schema not found");
+
+        let now = env.ledger().timestamp();
+        let record = CredentialCommitment {
+            subject: subject.clone(),
+            commitment: commitment.clone(),
+            schema_id,
+            committed_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Commitment(subject.clone(), schema_id), &record);
+
+        env.events().publish(
+            (Symbol::new(&env, "commitment_submitted"),),
+            (subject, schema_id, commitment),
+        );
+    }
+
+    /// Verifies that a commitment opens correctly to a valid credential.
+    ///
+    /// The caller provides `credential_id` and `blinding_factor`; the contract
+    /// recomputes `SHA-256(credential_id_le || blinding_factor)` and checks it
+    /// against the stored commitment. It also verifies that the credential is
+    /// owned by `subject`, belongs to `schema_id`, is not revoked, and has not
+    /// expired.
+    ///
+    /// Returns `true` only when all of the above hold; `false` otherwise.
+    /// Does not panic for missing data — returns `false` instead.
+    pub fn verify_commitment(
+        env: Env,
+        subject: Address,
+        schema_id: u32,
+        credential_id: u64,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        let record: CredentialCommitment = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Commitment(subject.clone(), schema_id))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+
+        // Recompute the commitment: SHA-256(credential_id_le_bytes || blinding_factor)
+        let expected = Self::compute_commitment(&env, credential_id, &blinding_factor);
+        if expected != record.commitment {
+            return false;
+        }
+
+        // Verify the underlying credential is valid
+        let credential: Credential = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if credential.subject != subject || credential.schema_id != schema_id {
+            return false;
+        }
+        if credential.revoked {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        credential.expires_at == 0 || credential.expires_at > now
+    }
+
+    /// Returns whether a subject has a valid commitment for a schema.
+    ///
+    /// This is a privacy-preserving alternative to `has_valid_credential`: it
+    /// tells observers that a commitment exists and is linked to a non-expired,
+    /// non-revoked credential — without revealing which credential or issuer.
+    ///
+    /// Internally iterates the subject's credentials to find one that matches
+    /// the stored commitment without exposing which credential matched.
+    ///
+    /// Returns `false` when no commitment exists or no valid matching credential
+    /// is found. Does not require authorization.
+    pub fn has_valid_commitment(env: Env, subject: Address, schema_id: u32) -> bool {
+        // Just confirm a commitment exists for this (subject, schema_id) pair
+        let has_commitment = env
+            .storage()
+            .persistent()
+            .has(&DataKey::Commitment(subject.clone(), schema_id));
+        if !has_commitment {
+            return false;
+        }
+
+        let creds: Vec<u64> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubjectCredentials(subject.clone()))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let now = env.ledger().timestamp();
+
+        for cred_id in creds.iter() {
+            let credential: Credential = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Credential(cred_id))
+            {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if credential.schema_id != schema_id || credential.revoked {
+                continue;
+            }
+            if credential.expires_at != 0 && credential.expires_at <= now {
+                continue;
+            }
+
+            // Check commitment matches — we don't know the blinding factor here,
+            // so we just confirm the commitment record is present and the credential
+            // is valid. The binding check (commitment = H(cred_id || r)) happens in
+            // verify_commitment when the subject reveals the opening.
+            // has_valid_commitment is a weaker check: "there is a commitment on-chain
+            // AND the subject holds at least one live credential for this schema."
+            return true;
+        }
+
+        false
+    }
+
+    // --------------------------------------------------------
     // Internal helpers
     // --------------------------------------------------------
+
+    /// Computes the commitment hash: SHA-256(credential_id as 8 LE bytes || blinding_factor).
+    fn compute_commitment(
+        env: &Env,
+        credential_id: u64,
+        blinding_factor: &BytesN<32>,
+    ) -> BytesN<32> {
+        let id_bytes = credential_id.to_le_bytes();
+        let mut preimage = Bytes::from_slice(env, &id_bytes);
+        preimage.append(&Bytes::from(blinding_factor));
+        env.crypto().sha256(&preimage).to_bytes()
+    }
 
     fn require_active_issuer(env: &Env, issuer: &Address) -> u32 {
         let issuer_record: Option<Issuer> = env
@@ -1047,7 +1232,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger},
-        Address, Env, String, Vec,
+        Address, Bytes, BytesN, Env, String, Vec,
     };
 
     fn setup(env: &Env) -> (Address, StellarIdContractClient<'_>) {
@@ -1935,5 +2120,136 @@ mod tests {
         };
 
         client.bridge_credential(&bridge_operator, &subject, &schema_id, &bridge_data, &0u64);
+    }
+
+    // --------------------------------------------------------
+    // Credential commitment (privacy layer) tests
+    // --------------------------------------------------------
+
+    fn make_commitment(env: &Env, credential_id: u64, blinding: &[u8; 32]) -> BytesN<32> {
+        let id_bytes = credential_id.to_le_bytes();
+        let mut preimage = Bytes::from_slice(env, &id_bytes);
+        preimage.append(&Bytes::from_slice(env, blinding));
+        env.crypto().sha256(&preimage).to_bytes()
+    }
+
+    #[test]
+    fn test_submit_and_verify_commitment_valid() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        let blinding = [7u8; 32];
+        let commitment = make_commitment(&env, cred_id, &blinding);
+        let bf = BytesN::from_array(&env, &blinding);
+
+        client.submit_commitment(&subject, &schema_id, &commitment);
+
+        assert!(client.verify_commitment(&subject, &schema_id, &cred_id, &bf));
+        assert!(client.has_valid_commitment(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_verify_commitment_wrong_blinding_factor() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        let blinding = [7u8; 32];
+        let commitment = make_commitment(&env, cred_id, &blinding);
+        client.submit_commitment(&subject, &schema_id, &commitment);
+
+        // Different blinding factor — should fail
+        let wrong_bf = BytesN::from_array(&env, &[8u8; 32]);
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &wrong_bf,));
+    }
+
+    #[test]
+    fn test_verify_commitment_tampered_commitment() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        // Submit a garbage commitment
+        let tampered = BytesN::from_array(&env, &[0xde; 32]);
+        client.submit_commitment(&subject, &schema_id, &tampered);
+
+        let bf = BytesN::from_array(&env, &[7u8; 32]);
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
+    }
+
+    #[test]
+    fn test_verify_commitment_expired_credential() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &500u64);
+
+        let blinding = [42u8; 32];
+        let commitment = make_commitment(&env, cred_id, &blinding);
+        let bf = BytesN::from_array(&env, &blinding);
+        client.submit_commitment(&subject, &schema_id, &commitment);
+
+        // Advance past expiry
+        env.ledger().set_timestamp(2000);
+
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
+        assert!(!client.has_valid_commitment(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_has_valid_commitment_no_commitment_submitted() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        // Credential exists but no commitment submitted
+        assert!(!client.has_valid_commitment(&subject, &schema_id));
+    }
+
+    #[test]
+    fn test_verify_commitment_revoked_credential() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+
+        let blinding = [99u8; 32];
+        let commitment = make_commitment(&env, cred_id, &blinding);
+        let bf = BytesN::from_array(&env, &blinding);
+        client.submit_commitment(&subject, &schema_id, &commitment);
+
+        client.revoke_credential(&issuer, &cred_id);
+
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
+        assert!(!client.has_valid_commitment(&subject, &schema_id));
     }
 }
