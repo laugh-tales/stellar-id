@@ -1196,9 +1196,8 @@ impl StellarIdContract {
     ) -> BytesN<32> {
         let id_bytes = credential_id.to_le_bytes();
         let mut preimage = Bytes::from_slice(env, &id_bytes);
-        let bf_bytes = Bytes::from(blinding_factor);
-        preimage.append(&bf_bytes);
-        BytesN::from(env.crypto().sha256(&preimage))
+        preimage.append(&Bytes::from(blinding_factor));
+        env.crypto().sha256(&preimage).to_bytes()
     }
 
     fn require_active_issuer(env: &Env, issuer: &Address) -> u32 {
@@ -2137,7 +2136,7 @@ mod tests {
         let id_bytes = credential_id.to_le_bytes();
         let mut preimage = Bytes::from_slice(env, &id_bytes);
         preimage.append(&Bytes::from_slice(env, blinding));
-        BytesN::from(env.crypto().sha256(&preimage))
+        env.crypto().sha256(&preimage).to_bytes()
     }
 
     #[test]
