@@ -1,7 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -1038,12 +1037,7 @@ impl StellarIdContract {
     ///
     /// Panics if `subject` does not authorize the call or `schema_id` does not
     /// exist.
-    pub fn submit_commitment(
-        env: Env,
-        subject: Address,
-        schema_id: u32,
-        commitment: BytesN<32>,
-    ) {
+    pub fn submit_commitment(env: Env, subject: Address, schema_id: u32, commitment: BytesN<32>) {
         subject.require_auth();
         // Verify the schema exists (no need for it to be active — committing to
         // an existing credential under a since-deactivated schema is valid).
@@ -1097,8 +1091,7 @@ impl StellarIdContract {
         };
 
         // Recompute the commitment: SHA-256(credential_id_le_bytes || blinding_factor)
-        let expected =
-            Self::compute_commitment(&env, credential_id, &blinding_factor);
+        let expected = Self::compute_commitment(&env, credential_id, &blinding_factor);
         if expected != record.commitment {
             return false;
         }
@@ -2133,11 +2126,7 @@ mod tests {
     // Credential commitment (privacy layer) tests
     // --------------------------------------------------------
 
-    fn make_commitment(
-        env: &Env,
-        credential_id: u64,
-        blinding: &[u8; 32],
-    ) -> BytesN<32> {
+    fn make_commitment(env: &Env, credential_id: u64, blinding: &[u8; 32]) -> BytesN<32> {
         let id_bytes = credential_id.to_le_bytes();
         let mut preimage = Bytes::from_slice(env, &id_bytes);
         preimage.append(&Bytes::from_slice(env, blinding));
@@ -2182,12 +2171,7 @@ mod tests {
 
         // Different blinding factor — should fail
         let wrong_bf = BytesN::from_array(&env, &[8u8; 32]);
-        assert!(!client.verify_commitment(
-            &subject,
-            &schema_id,
-            &cred_id,
-            &wrong_bf,
-        ));
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &wrong_bf,));
     }
 
     #[test]
@@ -2206,12 +2190,7 @@ mod tests {
         client.submit_commitment(&subject, &schema_id, &tampered);
 
         let bf = BytesN::from_array(&env, &[7u8; 32]);
-        assert!(!client.verify_commitment(
-            &subject,
-            &schema_id,
-            &cred_id,
-            &bf,
-        ));
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
     }
 
     #[test]
@@ -2233,12 +2212,7 @@ mod tests {
         // Advance past expiry
         env.ledger().set_timestamp(2000);
 
-        assert!(!client.verify_commitment(
-            &subject,
-            &schema_id,
-            &cred_id,
-            &bf,
-        ));
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
         assert!(!client.has_valid_commitment(&subject, &schema_id));
     }
 
@@ -2275,12 +2249,7 @@ mod tests {
 
         client.revoke_credential(&issuer, &cred_id);
 
-        assert!(!client.verify_commitment(
-            &subject,
-            &schema_id,
-            &cred_id,
-            &bf,
-        ));
+        assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
         assert!(!client.has_valid_commitment(&subject, &schema_id));
     }
 }
