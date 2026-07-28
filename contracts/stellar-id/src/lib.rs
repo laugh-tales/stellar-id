@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -29,6 +29,73 @@ pub struct Credential {
     pub schema_id: u32,
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
+    pub revoked: bool,
+    pub credential_hash: BytesN<32>,
+}
+
+/// Proposal types for on-chain credential governance
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalType {
+    AddIssuer,
+    RemoveIssuer,
+    UpdateTrustLevel,
+    UpdateConfig,
+    UpdateAdmin,
+}
+
+/// Status of an on-chain proposal
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Active,
+    Passed,
+    Failed,
+    Executed,
+    Vetoed,
+}
+
+/// An on-chain governance proposal
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub proposal_type: ProposalType,
+    pub payload: Bytes,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub voters: Vec<Address>,
+    pub status: ProposalStatus,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    pub executes_at: u64,
+}
+
+/// A selective disclosure credential using Merkle trees
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SelectiveCredential {
+    pub id: u64,
+    pub subject: Address,
+    pub issuer: Address,
+    pub schema_id: u32,
+    pub merkle_root: BytesN<32>,
+    pub field_count: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
+/// A credential delegation link in a trust chain
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegationLink {
+    pub parent: Address,
+    pub delegate: Address,
+    pub max_depth: u32,
+    pub trust_fraction: u32, // basis points, max 10000
+    pub created_at: u64,
     pub revoked: bool,
 }
 
@@ -127,6 +194,26 @@ pub enum DataKey {
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    // schema_id -> BytesN<32> accumulator
+    SchemaAccumulator(u32),
+    // schema_id -> u32 count
+    SchemaHolderCount(u32),
+    // proposal_id -> Proposal
+    Proposal(u64),
+    // u64 counter for proposal IDs
+    ProposalCount,
+    // timestamp for emergency action cooldown
+    EmergencyCooldown,
+    // selective_cred_id -> SelectiveCredential
+    SelectiveCredential(u64),
+    // u64 counter for selective credential IDs
+    SelectiveCredentialCount,
+    // (parent, delegate) -> DelegationLink
+    DelegationLink(Address, Address),
+    // parent -> Vec<Address> delegates
+    DelegateChildren(Address),
+    // delegate -> Address parent
+    DelegateParent(Address),
 }
 
 // ============================================================
@@ -460,6 +547,15 @@ impl StellarIdContract {
             .unwrap_or(0);
         let credential_id = count + 1;
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            issuer.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -468,7 +564,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
         env.storage()
             .persistent()
@@ -508,15 +607,30 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Identity(subject.clone()), &identity);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += 1;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credential_issued"),),
@@ -566,6 +680,15 @@ impl StellarIdContract {
             count += 1;
             let credential_id = count;
 
+            let credential_hash = Self::compute_expected_hash(
+                env.clone(),
+                schema_id,
+                subject.clone(),
+                issuer.clone(),
+                now,
+                expires_at,
+            );
+
             let credential = Credential {
                 id: credential_id,
                 subject: subject.clone(),
@@ -574,7 +697,10 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
+                credential_hash,
             };
+
+            Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
             env.storage()
                 .persistent()
@@ -619,15 +745,30 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::CredentialCount, &count);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += subjects.len() as u64;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += subjects.len() as u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += subjects.len() as u64;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credentials_batch_issued"),),
@@ -689,6 +830,15 @@ impl StellarIdContract {
             0
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            operator.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -697,7 +847,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
         env.storage()
             .persistent()
@@ -803,6 +956,8 @@ impl StellarIdContract {
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
+
+        Self::update_schema_accumulator(&env, credential.schema_id, &credential.subject, false);
 
         env.events().publish(
             (Symbol::new(&env, "credential_revoked"),),
@@ -1381,7 +1536,7 @@ impl StellarIdContract {
             assert!(record.active, "Issuer is not active");
             record.trust_level
         } else {
-            panic!("Not a registered issuer");
+            Self::compute_delegated_trust(env.clone(), issuer.clone())
         }
     }
 
@@ -1435,6 +1590,15 @@ impl StellarIdContract {
             rec.map(|r| r.trust_level).unwrap_or(1)
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            request.schema_id,
+            request.subject.clone(),
+            issuer.clone(),
+            now,
+            request.expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: request.subject.clone(),
@@ -1443,7 +1607,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at: request.expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(env, request.schema_id, &request.subject, true);
 
         env.storage()
             .persistent()
@@ -1497,6 +1664,726 @@ impl StellarIdContract {
             (Symbol::new(env, "multisig_credential_issued"),),
             (request_id, credential_id, request.subject, request.schema_id),
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #64: Credential Hash Registry & EIP-712-style Hashing
+    // --------------------------------------------------------
+
+    pub fn compute_expected_hash(
+        env: Env,
+        schema_id: u32,
+        subject: Address,
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> BytesN<32> {
+        let contract_addr = env.current_contract_address();
+        let contract_bytes = Self::address_to_bytes(&env, &contract_addr);
+
+        let mut domain_buf = Bytes::new(&env);
+        domain_buf.append(&Bytes::from_slice(&env, b"StellarID:v1:"));
+        domain_buf.append(&contract_bytes);
+        let domain_separator = env.crypto().sha256(&domain_buf).to_bytes();
+
+        let mut buf = Bytes::new(&env);
+        buf.append(&Bytes::from_slice(&env, &domain_separator.to_array()));
+        buf.append(&Bytes::from_slice(&env, &schema_id.to_be_bytes()));
+        buf.append(&Self::address_to_bytes(&env, &subject));
+        buf.append(&Self::address_to_bytes(&env, &issuer));
+        buf.append(&Bytes::from_slice(&env, &issued_at.to_be_bytes()));
+        buf.append(&Bytes::from_slice(&env, &expires_at.to_be_bytes()));
+
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn get_credential_hash(env: Env, credential_id: u64) -> BytesN<32> {
+        let cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+        cred.credential_hash
+    }
+
+    pub fn verify_credential_hash(env: Env, credential_id: u64) -> bool {
+        let cred: Credential = match env.storage().persistent().get(&DataKey::Credential(credential_id)) {
+            Some(c) => c,
+            None => return false,
+        };
+        let expected = Self::compute_expected_hash(
+            env.clone(),
+            cred.schema_id,
+            cred.subject.clone(),
+            cred.issuer.clone(),
+            cred.issued_at,
+            cred.expires_at,
+        );
+        cred.credential_hash == expected
+    }
+
+    // --------------------------------------------------------
+    // Issue #65: Privacy-Preserving XOR Accumulator
+    // --------------------------------------------------------
+
+    pub fn get_schema_accumulator(env: Env, schema_id: u32) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaAccumulator(schema_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    pub fn get_schema_holder_count(env: Env, schema_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaHolderCount(schema_id))
+            .unwrap_or(0)
+    }
+
+    pub fn generate_membership_witness(
+        env: Env,
+        subject: Address,
+        schema_id: u32,
+    ) -> (BytesN<32>, BytesN<32>) {
+        assert!(
+            Self::has_valid_credential(env.clone(), subject.clone(), schema_id),
+            "Subject does not hold a valid credential for schema"
+        );
+        let subject_b = Self::address_to_bytes(&env, &subject);
+        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
+        let acc = Self::get_schema_accumulator(env, schema_id);
+        (subject_hash, acc)
+    }
+
+    pub fn verify_membership_witness(
+        env: Env,
+        schema_id: u32,
+        subject_hash: BytesN<32>,
+        accumulator_snapshot: BytesN<32>,
+    ) -> bool {
+        let current_acc = Self::get_schema_accumulator(env.clone(), schema_id);
+        accumulator_snapshot == current_acc && subject_hash != BytesN::from_array(&env, &[0u8; 32])
+    }
+
+    // --------------------------------------------------------
+    // Issue #66: On-Chain Credential Governance
+    // --------------------------------------------------------
+
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        proposal_type: ProposalType,
+        payload: Bytes,
+    ) -> u64 {
+        proposer.require_auth();
+        Self::require_active_issuer(&env, &proposer);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+        let id = count + 1;
+
+        let now = env.ledger().timestamp();
+        let voting_ends_at = now + 7 * 24 * 3600;
+        let executes_at = voting_ends_at + 2 * 24 * 3600;
+
+        let proposal = Proposal {
+            id,
+            proposer,
+            proposal_type,
+            payload,
+            votes_for: 0,
+            votes_against: 0,
+            voters: Vec::new(&env),
+            status: ProposalStatus::Active,
+            created_at: now,
+            voting_ends_at,
+            executes_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &id);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            (id, proposal.proposer),
+        );
+
+        id
+    }
+
+    pub fn vote(env: Env, issuer: Address, proposal_id: u64, support: bool) {
+        issuer.require_auth();
+        Self::require_active_issuer(&env, &issuer);
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert!(proposal.status == ProposalStatus::Active, "Proposal is not active");
+        let now = env.ledger().timestamp();
+        assert!(now <= proposal.voting_ends_at, "Voting period has ended");
+
+        let already_voted = proposal.voters.iter().any(|v| v == issuer);
+        assert!(!already_voted, "Issuer has already voted");
+
+        proposal.voters.push_back(issuer.clone());
+        if support {
+            proposal.votes_for += 1;
+        } else {
+            proposal.votes_against += 1;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_voted"),),
+            (proposal_id, issuer, support),
+        );
+    }
+
+    pub fn finalize_proposal(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert!(proposal.status == ProposalStatus::Active, "Proposal is not active");
+        let now = env.ledger().timestamp();
+        assert!(now > proposal.voting_ends_at, "Voting period has not ended");
+
+        let quorum = 3u32;
+        if proposal.votes_for > proposal.votes_against && proposal.votes_for >= quorum {
+            proposal.status = ProposalStatus::Passed;
+        } else {
+            proposal.status = ProposalStatus::Failed;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_finalized"),),
+            (proposal_id, proposal.status.clone()),
+        );
+    }
+
+    pub fn execute_proposal(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert!(proposal.status == ProposalStatus::Passed, "Proposal is not in Passed status");
+        let now = env.ledger().timestamp();
+        assert!(now >= proposal.executes_at, "Time-lock period has not elapsed");
+
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_executed"),),
+            (proposal_id,),
+        );
+    }
+
+    pub fn veto_proposal(env: Env, admin: Address, proposal_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        assert!(admin == stored_admin, "Only admin can veto");
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert!(
+            proposal.status == ProposalStatus::Active || proposal.status == ProposalStatus::Passed,
+            "Cannot veto proposal in current state"
+        );
+
+        proposal.status = ProposalStatus::Vetoed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_vetoed"),),
+            (proposal_id, admin),
+        );
+    }
+
+    pub fn emergency_admin_action(env: Env, admin: Address, action_type: Symbol, target: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        assert!(admin == stored_admin, "Only admin can execute emergency actions");
+
+        let now = env.ledger().timestamp();
+        let last_action: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyCooldown)
+            .unwrap_or(0);
+        assert!(now >= last_action + 48 * 3600, "Emergency cooldown is active");
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyCooldown, &now);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_action"),),
+            (action_type, target),
+        );
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found")
+    }
+
+    // --------------------------------------------------------
+    // Issue #67: Selective Disclosure Merkle Proofs
+    // --------------------------------------------------------
+
+    pub fn hash_leaf(env: Env, field_name: String, field_value: String) -> BytesN<32> {
+        let mut buf = Bytes::new(&env);
+        buf.append(&field_name.to_xdr(&env));
+        buf.append(&Bytes::from_slice(&env, b":"));
+        buf.append(&field_value.to_xdr(&env));
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn compute_merkle_root(env: Env, leaves: Vec<BytesN<32>>) -> BytesN<32> {
+        assert!(!leaves.is_empty(), "Leaves vector cannot be empty");
+        let mut current = leaves;
+
+        while current.len() > 1 {
+            let mut next = Vec::new(&env);
+            if current.len() % 2 != 0 {
+                let last = current.get(current.len() - 1).unwrap();
+                current.push_back(last);
+            }
+            let pairs = current.len() / 2;
+            for i in 0..pairs {
+                let left = current.get(2 * i).unwrap();
+                let right = current.get(2 * i + 1).unwrap();
+                let mut buf = Bytes::new(&env);
+                buf.append(&Bytes::from_slice(&env, &left.to_array()));
+                buf.append(&Bytes::from_slice(&env, &right.to_array()));
+                next.push_back(env.crypto().sha256(&buf).to_bytes());
+            }
+            current = next;
+        }
+
+        current.get(0).unwrap()
+    }
+
+    pub fn verify_merkle_proof(
+        env: Env,
+        leaf: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+        root: BytesN<32>,
+        index: u32,
+    ) -> bool {
+        let mut current_hash = leaf;
+        let mut idx = index;
+
+        for p in proof.iter() {
+            let mut buf = Bytes::new(&env);
+            if idx % 2 == 0 {
+                buf.append(&Bytes::from_slice(&env, &current_hash.to_array()));
+                buf.append(&Bytes::from_slice(&env, &p.to_array()));
+            } else {
+                buf.append(&Bytes::from_slice(&env, &p.to_array()));
+                buf.append(&Bytes::from_slice(&env, &current_hash.to_array()));
+            }
+            current_hash = env.crypto().sha256(&buf).to_bytes();
+            idx /= 2;
+        }
+
+        current_hash == root
+    }
+
+    pub fn issue_selective_credential(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        schema_id: u32,
+        merkle_root: BytesN<32>,
+        field_count: u32,
+        duration: u64,
+    ) -> u64 {
+        issuer.require_auth();
+        Self::require_active_issuer(&env, &issuer);
+        Self::require_active_schema(&env, schema_id);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SelectiveCredentialCount)
+            .unwrap_or(0);
+        let id = count + 1;
+
+        let now = env.ledger().timestamp();
+        let expires_at = if duration > 0 { now + duration } else { 0 };
+
+        let cred = SelectiveCredential {
+            id,
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+            schema_id,
+            merkle_root,
+            field_count,
+            issued_at: now,
+            expires_at,
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SelectiveCredential(id), &cred);
+        env.storage()
+            .instance()
+            .set(&DataKey::SelectiveCredentialCount, &id);
+
+        env.events().publish(
+            (Symbol::new(&env, "selective_credential_issued"),),
+            (id, subject, issuer),
+        );
+
+        id
+    }
+
+    pub fn verify_credential_field(
+        env: Env,
+        credential_id: u64,
+        field_name: String,
+        field_value: String,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> bool {
+        let cred: SelectiveCredential = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SelectiveCredential(credential_id))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if cred.revoked {
+            return false;
+        }
+        let now = env.ledger().timestamp();
+        if cred.expires_at > 0 && now > cred.expires_at {
+            return false;
+        }
+
+        let leaf = Self::hash_leaf(env.clone(), field_name, field_value);
+        Self::verify_merkle_proof(env, leaf, proof, cred.merkle_root, leaf_index)
+    }
+
+    pub fn has_valid_field(
+        env: Env,
+        subject: Address,
+        schema_id: u32,
+        field_name: String,
+        field_value: String,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> bool {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SelectiveCredentialCount)
+            .unwrap_or(0);
+        for id in 1..=count {
+            if let Some(cred) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, SelectiveCredential>(&DataKey::SelectiveCredential(id))
+            {
+                if cred.subject == subject && cred.schema_id == schema_id {
+                    if Self::verify_credential_field(
+                        env.clone(),
+                        id,
+                        field_name.clone(),
+                        field_value.clone(),
+                        proof.clone(),
+                        leaf_index,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn get_selective_credential(env: Env, credential_id: u64) -> SelectiveCredential {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SelectiveCredential(credential_id))
+            .expect("Selective credential not found")
+    }
+
+    // --------------------------------------------------------
+    // Issue #68: Credential Delegation Chain
+    // --------------------------------------------------------
+
+    pub fn create_delegation(
+        env: Env,
+        parent: Address,
+        delegate: Address,
+        max_depth: u32,
+        trust_fraction: u32,
+    ) {
+        parent.require_auth();
+        assert!(trust_fraction <= 10000, "Trust fraction max 10000");
+
+        Self::require_active_issuer(&env, &parent);
+
+        let mut curr = parent.clone();
+        while let Some(p) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::DelegateParent(curr.clone()))
+        {
+            assert!(p != delegate, "Circular delegation detected");
+            curr = p;
+        }
+
+        let link = DelegationLink {
+            parent: parent.clone(),
+            delegate: delegate.clone(),
+            max_depth,
+            trust_fraction,
+            created_at: env.ledger().timestamp(),
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationLink(parent.clone(), delegate.clone()), &link);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateParent(delegate.clone()), &parent);
+
+        let mut children: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateChildren(parent.clone()))
+            .unwrap_or(Vec::new(&env));
+        children.push_back(delegate.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateChildren(parent.clone()), &children);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_created"),),
+            (parent, delegate, max_depth, trust_fraction),
+        );
+    }
+
+    pub fn resolve_delegation_chain(env: Env, issuer: Address) -> Vec<Address> {
+        let mut path = Vec::new(&env);
+        let mut curr = issuer;
+        path.push_back(curr.clone());
+
+        while let Some(parent) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::DelegateParent(curr.clone()))
+        {
+            path.push_back(parent.clone());
+            curr = parent;
+        }
+
+        path
+    }
+
+    pub fn compute_delegated_trust(env: Env, issuer: Address) -> u32 {
+        let rec: Option<Issuer> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()));
+        if let Some(record) = rec {
+            if record.active {
+                return record.trust_level;
+            }
+        }
+
+        let mut curr = issuer.clone();
+        let mut depth = 0u32;
+        let mut multiplier = 10000u64;
+
+        while let Some(parent) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::DelegateParent(curr.clone()))
+        {
+            let link: DelegationLink = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegationLink(parent.clone(), curr.clone()))
+            {
+                Some(l) => l,
+                None => panic!("Delegation link missing"),
+            };
+
+            assert!(!link.revoked, "Delegation link is revoked");
+            depth += 1;
+            assert!(depth <= link.max_depth, "Delegation depth limit exceeded");
+
+            multiplier = (multiplier * link.trust_fraction as u64) / 10000;
+            curr = parent;
+        }
+
+        let root_issuer: Issuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(curr))
+            .expect("Root issuer not found");
+        assert!(root_issuer.active, "Root issuer is inactive");
+
+        ((root_issuer.trust_level as u64 * multiplier) / 10000) as u32
+    }
+
+    pub fn revoke_delegation(env: Env, parent: Address, delegate: Address) {
+        parent.require_auth();
+
+        let mut link: DelegationLink = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationLink(parent.clone(), delegate.clone()))
+            .expect("Delegation link not found");
+
+        assert!(link.parent == parent, "Only parent can revoke delegation");
+        link.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationLink(parent.clone(), delegate.clone()), &link);
+
+        Self::recursive_revoke_delegates(&env, &delegate);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_revoked"),),
+            (parent, delegate),
+        );
+    }
+
+    fn recursive_revoke_delegates(env: &Env, parent: &Address) {
+        let children: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateChildren(parent.clone()))
+            .unwrap_or(Vec::new(env));
+
+        for child in children.iter() {
+            if let Some(mut link) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DelegationLink>(&DataKey::DelegationLink(parent.clone(), child.clone()))
+            {
+                link.revoked = true;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::DelegationLink(parent.clone(), child.clone()), &link);
+                Self::recursive_revoke_delegates(env, &child);
+            }
+        }
+    }
+
+    pub fn get_delegation_link(env: Env, parent: Address, delegate: Address) -> DelegationLink {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationLink(parent, delegate))
+            .expect("Delegation link not found")
+    }
+
+    // --------------------------------------------------------
+    // Internal helper implementations for cryptography
+    // --------------------------------------------------------
+
+    fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
+        let xdr = address.to_xdr(env);
+        if xdr.len() >= 32 {
+            xdr.slice(xdr.len() - 32..xdr.len())
+        } else {
+            let mut b = Bytes::new(env);
+            for _ in 0..(32 - xdr.len()) {
+                b.push_back(0);
+            }
+            b.append(&xdr);
+            b
+        }
+    }
+
+    fn xor_bytes_32(a: &BytesN<32>, b: &BytesN<32>) -> [u8; 32] {
+        let a_arr = a.to_array();
+        let b_arr = b.to_array();
+        let mut res = [0u8; 32];
+        for i in 0..32 {
+            res[i] = a_arr[i] ^ b_arr[i];
+        }
+        res
+    }
+
+    fn update_schema_accumulator(env: &Env, schema_id: u32, subject: &Address, is_issue: bool) {
+        let subject_b = Self::address_to_bytes(env, subject);
+        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
+        let old_acc: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaAccumulator(schema_id))
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
+        let xored = Self::xor_bytes_32(&old_acc, &subject_hash);
+        let new_acc = env.crypto().sha256(&Bytes::from_slice(env, &xored)).to_bytes();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaAccumulator(schema_id), &new_acc);
+
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaHolderCount(schema_id))
+            .unwrap_or(0);
+        let new_count = if is_issue {
+            current_count + 1
+        } else if current_count > 0 {
+            current_count - 1
+        } else {
+            0
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaHolderCount(schema_id), &new_count);
     }
 }
 
@@ -2746,5 +3633,237 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #64 Tests: Credential Hash Registry
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_credential_hash_calculation_and_verification() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let stored_hash = client.get_credential_hash(&cred_id);
+
+        let cred = client.get_credential(&cred_id);
+        let expected_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &cred.expires_at,
+        );
+
+        assert_eq!(stored_hash, expected_hash);
+        assert!(client.verify_credential_hash(&cred_id));
+    }
+
+    #[test]
+    fn test_credential_hash_modifying_field_changes_hash() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let cred = client.get_credential(&cred_id);
+
+        let tampered_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &(cred.expires_at + 10),
+        );
+
+        assert_ne!(cred.credential_hash, tampered_hash);
+    }
+
+    // --------------------------------------------------------
+    // Issue #65 Tests: XOR Accumulator
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_schema_accumulator_issue_and_revoke() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject1 = Address::generate(&env);
+        let subject2 = Address::generate(&env);
+
+        assert_eq!(client.get_schema_holder_count(&schema_id), 0);
+        let initial_acc = client.get_schema_accumulator(&schema_id);
+
+        let cred1 = client.issue_credential(&issuer, &subject1, &schema_id, &0);
+        let acc1 = client.get_schema_accumulator(&schema_id);
+        assert_ne!(initial_acc, acc1);
+        assert_eq!(client.get_schema_holder_count(&schema_id), 1);
+
+        let _cred2 = client.issue_credential(&issuer, &subject2, &schema_id, &0);
+        let acc2 = client.get_schema_accumulator(&schema_id);
+        assert_ne!(acc1, acc2);
+        assert_eq!(client.get_schema_holder_count(&schema_id), 2);
+
+        // Membership witness
+        let (witness_hash, witness_acc) = client.generate_membership_witness(&subject1, &schema_id);
+        assert_eq!(witness_acc, acc2);
+        assert!(client.verify_membership_witness(&schema_id, &witness_hash, &acc2));
+
+        // Revocation updates accumulator
+        client.revoke_credential(&issuer, &cred1);
+        let acc3 = client.get_schema_accumulator(&schema_id);
+        assert_ne!(acc2, acc3);
+        assert_eq!(client.get_schema_holder_count(&schema_id), 1);
+    }
+
+    // --------------------------------------------------------
+    // Issue #66 Tests: Governance Lifecycle
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_governance_proposal_full_lifecycle() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let proposer = issuers.get(0).unwrap();
+
+        let payload = Bytes::from_slice(&env, b"test_payload");
+        let proposal_id = client.create_proposal(&proposer, &ProposalType::AddIssuer, &payload);
+
+        let prop = client.get_proposal(&proposal_id);
+        assert_eq!(prop.status, ProposalStatus::Active);
+
+        // Vote
+        client.vote(&issuers.get(0).unwrap(), &proposal_id, &true);
+        client.vote(&issuers.get(1).unwrap(), &proposal_id, &true);
+        client.vote(&issuers.get(2).unwrap(), &proposal_id, &true);
+
+        // Fast forward past voting period (7 days)
+        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
+        client.finalize_proposal(&proposal_id);
+
+        let prop_passed = client.get_proposal(&proposal_id);
+        assert_eq!(prop_passed.status, ProposalStatus::Passed);
+
+        // Fast forward past execution time-lock (2 days after voting ends)
+        env.ledger().set_timestamp(1000 + 9 * 24 * 3600 + 2);
+        client.execute_proposal(&proposal_id);
+
+        let prop_exec = client.get_proposal(&proposal_id);
+        assert_eq!(prop_exec.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_governance_veto_during_timelock() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let proposer = issuers.get(0).unwrap();
+
+        let payload = Bytes::from_slice(&env, b"veto_payload");
+        let proposal_id = client.create_proposal(&proposer, &ProposalType::RemoveIssuer, &payload);
+
+        client.vote(&issuers.get(0).unwrap(), &proposal_id, &true);
+        client.vote(&issuers.get(1).unwrap(), &proposal_id, &true);
+        client.vote(&issuers.get(2).unwrap(), &proposal_id, &true);
+
+        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
+        client.finalize_proposal(&proposal_id);
+
+        // Admin vetoes during time-lock
+        client.veto_proposal(&admin, &proposal_id);
+        let prop = client.get_proposal(&proposal_id);
+        assert_eq!(prop.status, ProposalStatus::Vetoed);
+    }
+
+    // --------------------------------------------------------
+    // Issue #67 Tests: Selective Disclosure Merkle Trees
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_selective_disclosure_merkle_tree() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let leaf0 = client.hash_leaf(&String::from_str(&env, "name"), &String::from_str(&env, "Alice"));
+        let leaf1 = client.hash_leaf(&String::from_str(&env, "age"), &String::from_str(&env, "30"));
+        let leaf2 = client.hash_leaf(&String::from_str(&env, "country"), &String::from_str(&env, "US"));
+        let leaf3 = client.hash_leaf(&String::from_str(&env, "role"), &String::from_str(&env, "Admin"));
+
+        let mut leaves = Vec::new(&env);
+        leaves.push_back(leaf0.clone());
+        leaves.push_back(leaf1.clone());
+        leaves.push_back(leaf2.clone());
+        leaves.push_back(leaf3.clone());
+
+        let root = client.compute_merkle_root(&leaves);
+
+        let sel_id = client.issue_selective_credential(&issuer, &subject, &schema_id, &root, &4u32, &3600u64);
+        let sel_cred = client.get_selective_credential(&sel_id);
+        assert_eq!(sel_cred.merkle_root, root);
+
+        // Proof for leaf 1 ("age", "30") at index 1
+        let mut proof1 = Vec::new(&env);
+        proof1.push_back(leaf0.clone());
+        let right_sub = {
+            let mut b = Bytes::new(&env);
+            b.append(&Bytes::from_slice(&env, &leaf2.to_array()));
+            b.append(&Bytes::from_slice(&env, &leaf3.to_array()));
+            env.crypto().sha256(&b).to_bytes()
+        };
+        proof1.push_back(right_sub);
+
+        let valid = client.verify_credential_field(
+            &sel_id,
+            &String::from_str(&env, "age"),
+            &String::from_str(&env, "30"),
+            &proof1,
+            &1u32,
+        );
+        assert!(valid);
+    }
+
+    // --------------------------------------------------------
+    // Issue #68 Tests: Delegation Chains
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_delegation_chain_trust_decay_and_revocation() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let root_issuer = register_issuer_helper(&env, &client, &admin);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+
+        client.create_delegation(&root_issuer, &delegate1, &3u32, &5000u32);
+        let link1 = client.get_delegation_link(&root_issuer, &delegate1);
+        assert_eq!(link1.trust_fraction, 5000);
+
+        client.create_delegation(&delegate1, &delegate2, &3u32, &8000u32);
+
+        let trust2 = client.compute_delegated_trust(&delegate2);
+        assert_eq!(trust2, 32);
+
+        let schema_id = register_schema_helper(&env, &client, &root_issuer);
+        let subject = Address::generate(&env);
+        let cred_id = client.issue_credential(&delegate2, &subject, &schema_id, &0);
+        let cred = client.get_credential(&cred_id);
+        assert_eq!(cred.issuer, delegate2);
+
+        client.revoke_delegation(&root_issuer, &delegate1);
+        let link2 = client.get_delegation_link(&delegate1, &delegate2);
+        assert!(link2.revoked);
     }
 }

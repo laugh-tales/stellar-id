@@ -42,7 +42,8 @@ Credential (persistent storage, keyed by credential_id u64)
   ├── schema_id
   ├── issued_at
   ├── expires_at (0 = no expiry)
-  └── revoked
+  ├── revoked
+  └── credential_hash (BytesN<32>)
 
 Identity (persistent storage, keyed by subject Address)
   ├── credential_count
@@ -58,8 +59,8 @@ SubIssuer (persistent storage, keyed by (parent, sub) tuple)
 
 ## Storage Strategy
 
-- `instance()` — used for global counters (CredentialCount, SchemaCount) and Admin
-- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities)
+- `instance()` — used for global counters (CredentialCount, SchemaCount, ProposalCount, SelectiveCredentialCount) and Admin
+- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities, Proposals, Accumulators, Merkle Credentials, DelegationLinks)
 
 Persistent storage entries have their own TTL and survive contract upgrades. Instance storage is tied to the contract instance.
 
@@ -73,54 +74,106 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 | `authorize_sub_issuer` | Parent issuer only |
 | `revoke_sub_issuer` | Parent issuer only |
 | `register_schema` | Active issuer only |
-| `issue_credential` | Active registered issuer only |
+| `issue_credential` | Active registered/delegated issuer only |
 | `revoke_credential` | Original issuer only |
-| All `get_*` / `has_*` | Anyone — no auth required |
+| `create_proposal` | Active registered issuer only |
+| `vote` | Active registered issuer only |
+| `finalize_proposal` | Anyone (after voting period) |
+| `execute_proposal` | Anyone (after time-lock) |
+| `veto_proposal` | Admin only |
+| `emergency_admin_action` | Admin only (48h cooldown) |
+| `issue_selective_credential` | Active issuer only |
+| `create_delegation` | Parent issuer only |
+| `revoke_delegation` | Parent issuer only |
+| All `get_*` / `has_*` / `verify_*` | Anyone — no auth required |
 
-## Events
+---
 
-| Event | Emitted When |
-|---|---|
-| `issuer_registered` | New issuer approved |
-| `issuer_deactivated` | Issuer disabled |
-| `sub_issuer_authorized` | Sub-issuer delegation granted |
-| `sub_issuer_revoked` | Sub-issuer delegation removed |
-| `schema_registered` | New schema created |
-| `credential_issued` | Credential issued to subject |
-| `credential_revoked` | Credential revoked |
+## Canonical Credential Hashing Standard (EIP-712 Style)
 
-## Reputation Score Formula
+Credential authenticity in StellarID supports off-chain verification using an EIP-712-style deterministic typed structured data hashing scheme.
 
+### Domain Separator
 ```
-reputation = min(credential_count × 10 + (trust_level / 10), 1000)
+domain_separator = SHA-256( ASCII("StellarID:v1:") || contract_address_32_bytes )
 ```
 
-The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
+### Credential Encoding
+```
+credential_hash = SHA-256(
+    domain_separator (32 bytes) ||
+    schema_id (4 bytes big-endian u32) ||
+    subject_address (32 bytes) ||
+    issuer_address (32 bytes) ||
+    issued_at (8 bytes big-endian u64) ||
+    expires_at (8 bytes big-endian u64)
+)
+```
 
-## Credential Commitment Scheme
+All field byte encodings are fixed-width big-endian values. Address values are converted into 32-byte fixed representation. Off-chain verifiers can reproduce this hash using the issuer's public key and credential metadata without querying Stellar.
 
-StellarID credentials are stored in plaintext. The commitment layer lets a subject prove they hold a valid credential without revealing which one.
+---
 
-### How it works
+## Anonymous XOR Accumulator & Membership Proofs
 
-1. **Commit** — the subject picks a random 32-byte blinding factor `r` and computes:
-   ```
-   commitment = SHA-256(credential_id_as_8_le_bytes || r)
-   ```
-   They call `submit_commitment(subject, schema_id, commitment)`. Only the hash goes on-chain.
+StellarID maintains a privacy-preserving cryptographic accumulator for each credential schema.
 
-2. **Prove** — when a verifier calls `verify_commitment(subject, schema_id, credential_id, r)`, the contract recomputes the hash and checks it matches the stored commitment. It also checks the credential is valid (not revoked, not expired, owned by subject).
+### Accumulator Formula
+For a set of credential holders `{addr1, addr2, ..., addrN}`:
+```
+acc_0 = 0x00...00 (32 bytes of 0s)
+acc_k = SHA-256( acc_{k-1} XOR SHA-256(subject_bytes) )
+```
 
-3. **Query** — `has_valid_commitment(subject, schema_id)` returns whether a commitment exists and the subject holds at least one live credential for that schema, without revealing which credential.
-
-### Security properties
-
-- **Hiding** — SHA-256 is a one-way function; the commitment reveals nothing about `credential_id` or `r`.
-- **Binding** — it is computationally infeasible to find a different `(credential_id', r')` that produces the same commitment.
-- **Privacy** — observers on-chain see only the hash, not the credential ID or issuer.
+### Verification & Witness
+- `generate_membership_witness(env, subject, schema_id)` returns `(subject_hash, accumulator)`.
+- `verify_membership_witness(env, schema_id, subject_hash, snapshot)` verifies whether `subject_hash` matches an active credential holder at `snapshot`.
+- `get_schema_holder_count(env, schema_id)` exposes total active holder count without revealing wallet addresses.
 
 ### Limitations
+This scheme relies on snapshot consistency. Off-chain verifiers should request recent accumulator snapshots to verify membership.
 
-- `has_valid_commitment` is a weaker guarantee than `verify_commitment`. It confirms a commitment exists and a live credential exists for the schema, but does not bind the two together. Full binding requires the subject to reveal the opening via `verify_commitment`.
-- The commitment is per `(subject, schema_id)`. Submitting again overwrites the previous commitment.
+---
 
+## On-Chain Credential Governance System
+
+StellarID features fully decentralized on-chain proposal voting and time-locked execution.
+
+### Proposal Lifecycle
+1. **Creation**: An active issuer calls `create_proposal(proposer, proposal_type, payload)`. Voting window is set to 7 days.
+2. **Voting**: Registered active issuers call `vote(issuer, proposal_id, support)`. Each issuer has exactly 1 vote per proposal.
+3. **Finalization**: After 7 days, `finalize_proposal(proposal_id)` transitions status to `Passed` if `votes_for > votes_against` and `votes_for >= 3` (quorum), or `Failed` otherwise.
+4. **Execution**: After a 2-day time-lock (`executes_at`), `execute_proposal(proposal_id)` decodes payload and executes the governance action.
+5. **Veto & Emergency**: Admin can veto proposals during voting or time-lock via `veto_proposal`. `emergency_admin_action` enforces a 48-hour global cooldown.
+
+---
+
+## Selective Disclosure Proofs (Merkle Trees)
+
+Selective disclosure allows subjects to prove individual credential attributes (e.g. `age: 30`) without revealing other fields.
+
+### Merkle Tree Specification
+- **Leaf Hash**: `SHA-256( field_name_xdr || ASCII(":") || field_value_xdr )`
+- **Internal Nodes**: Binary Merkle tree combining adjacent pairs: `SHA-256( left || right )`. Odd leaf layers duplicate the last leaf.
+- **Proof Verification**: `verify_credential_field` recomputes the Merkle path and verifies against `merkle_root` stored on `SelectiveCredential`.
+
+---
+
+## Transitive Credential Delegation Chain
+
+StellarID supports multi-hop hierarchical delegation chains with depth limits and trust decay.
+
+### Delegation Link
+A `DelegationLink` defines `(parent, delegate, max_depth, trust_fraction)`.
+
+### Trust Decay Calculation
+Trust decays across delegate hops using fixed-point integer math:
+```
+delegated_trust = (root_trust × fraction_1 / 10000 × fraction_2 / 10000 × ... × fraction_k / 10000)
+```
+where `trust_fraction` is expressed in basis points (max 10,000 = 100%).
+
+### Safety Mechanisms
+- **Circular Delegation**: `create_delegation` walks the parent chain and rejects circular loops.
+- **Depth Limit**: Rejects delegation chains exceeding `max_depth`.
+- **Cascading Revocation**: Calling `revoke_delegation(parent, delegate)` recursively revokes the link and all sub-delegate descendant links.
